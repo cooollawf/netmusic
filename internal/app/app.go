@@ -7,10 +7,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"image"
-	"io"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"math/rand"
 	"net/http"
 	"os"
@@ -401,6 +400,10 @@ func (a *App) play(t netease.Track) {
 	a.playError = ""
 	a.lyricDoc = nil
 	a.lyricFor = 0
+	// Drop the previous album art immediately. Without this the old cover stays
+	// on screen whenever the new track has no art (or its download fails),
+	// which reads as "the cover never refreshes".
+	a.setCover(nil)
 	a.lyr.SetDoc(nil, t.Name)
 	a.Main.Invalidate()
 
@@ -498,33 +501,61 @@ func (a *App) download(u string) ([]byte, error) {
 	return data, nil
 }
 
+// setCover replaces the album art. UI thread only.
+func (a *App) setCover(dib *w32.DIB) {
+	if a.curCover != nil {
+		a.curCover.Free()
+	}
+	a.curCover = dib
+	a.Main.Invalidate()
+}
+
 func (a *App) loadCover(t netease.Track) {
+	// Any failure path must also clear the art, otherwise the previous track's
+	// cover stays visible and looks like "the cover never updates".
+	clearCover := func() {
+		a.post(func() {
+			if a.cur.ID == t.ID {
+				a.setCover(nil)
+			}
+		})
+	}
 	if t.PicURL == "" {
+		clearCover()
 		return
 	}
 	u := netease.PicURL(t.PicURL, 200)
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
+		clearCover()
 		return
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := a.http.Do(req)
 	if err != nil {
+		clearCover()
 		return
 	}
 	defer resp.Body.Close()
-	var img image.Image
-	if strings.Contains(u, ".png") {
-		img, err = png.Decode(resp.Body)
-	} else {
-		img, err = jpeg.Decode(resp.Body)
+	// Read once, then try both decoders: NetEase mixes .jpg/.png (and a few
+	// extension-less URLs), and sniffing the bytes is more reliable than the URL.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		clearCover()
+		return
 	}
-	if err != nil || img == nil {
+	img, derr := jpeg.Decode(bytes.NewReader(data))
+	if derr != nil {
+		img, derr = png.Decode(bytes.NewReader(data))
+	}
+	if derr != nil || img == nil {
+		clearCover()
 		return
 	}
 	size := ui.CoverSize()
 	dib := w32.ImageToDIB(img, size, size)
 	if dib == nil {
+		clearCover()
 		return
 	}
 	a.post(func() {
@@ -532,11 +563,7 @@ func (a *App) loadCover(t netease.Track) {
 			dib.Free()
 			return
 		}
-		if a.curCover != nil {
-			a.curCover.Free()
-		}
-		a.curCover = dib
-		a.Main.Invalidate()
+		a.setCover(dib)
 	})
 }
 

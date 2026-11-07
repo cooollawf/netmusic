@@ -302,7 +302,7 @@ func (c *Class) Create(spec WindowSpec) uintptr {
 		uintptr(unsafe.Pointer(title)),
 		uintptr(spec.Style),
 		uintptr(x), uintptr(y), uintptr(spec.W), uintptr(spec.H),
-		0, 0, ModHandle(), tok,
+		spec.Owner, 0, ModHandle(), tok,
 	)
 	return hwnd
 }
@@ -313,6 +313,7 @@ type WindowSpec struct {
 	W, H    int32
 	Style   uint32
 	ExStyle uint32
+	Owner   uintptr // owner window for popups (hidden/destroyed with it)
 	Handler Handler
 	Center  bool
 }
@@ -486,6 +487,11 @@ func IsHotkeyDown(vk int) bool {
 	r, _, _ := procGetAsyncKey.Call(uintptr(vk))
 	return r&0x8000 != 0
 }
+
+const (
+	WS_EX_TOOLWINDOW = 0x00000080
+	WS_EX_APPWINDOW  = 0x00040000
+)
 
 // ---------------------------------------------------------------------------
 // child controls

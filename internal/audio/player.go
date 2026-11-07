@@ -20,6 +20,13 @@ type Player struct {
 	posMs   atomic.Int64
 	durMs   atomic.Int64
 	closed  atomic.Bool
+	// gen is bumped by Load; activeGen follows once the audio goroutine has
+	// adopted that track. Until they match, Position reports 0 so a freshly
+	// loaded lyric sheet is never positioned with the *previous* track's clock
+	// (that made the highlight leap to the old spot and then snap back to the
+	// start — the reported "twitching").
+	gen       atomic.Int64
+	activeGen atomic.Int64
 
 	mu   sync.Mutex
 	note string // last state note, e.g. "缓冲中…" (UI reads it rarely)
@@ -45,6 +52,7 @@ type command struct {
 	data []byte
 	frac float64
 	vol  int
+	gen  int64
 }
 
 // NewPlayer creates the player and starts its goroutine.
@@ -61,18 +69,23 @@ func (p *Player) SetOnError(f func(error)) { p.OnError = f }
 // Load hands a compressed MP3 buffer to the player. The buffer is owned by the
 // player and released when the next song loads.
 func (p *Player) Load(data []byte, seconds int) {
+	gen := p.gen.Add(1)
 	select {
-	case p.cmds <- command{kind: cmdLoad, data: data}:
+	case p.cmds <- command{kind: cmdLoad, data: data, gen: gen}:
 	default:
 		// Queue full (rapid track switching): drop the oldest by draining one.
 		select {
 		case <-p.cmds:
 		default:
 		}
-		p.cmds <- command{kind: cmdLoad, data: data}
+		p.cmds <- command{kind: cmdLoad, data: data, gen: gen}
 	}
 	p.durMs.Store(int64(seconds) * 1000)
 }
+
+// PendingLoad reports whether a Load has not been adopted by the audio thread
+// yet, in which case the reported position belongs to the previous track.
+func (p *Player) PendingLoad() bool { return p.activeGen.Load() != p.gen.Load() }
 
 func (p *Player) Toggle()      { p.post(command{kind: cmdToggle}) }
 func (p *Player) Play()        { p.post(command{kind: cmdPlay}) }
@@ -98,8 +111,15 @@ func (p *Player) post(c command) {
 	}
 }
 
-// Position returns the playback position in seconds.
-func (p *Player) Position() float64 { return float64(p.posMs.Load()) / 1000 }
+// Position returns the playback position in seconds. It reports 0 while a newly
+// loaded track has not been adopted yet, so callers never see the previous
+// track's clock.
+func (p *Player) Position() float64 {
+	if p.activeGen.Load() != p.gen.Load() {
+		return 0
+	}
+	return float64(p.posMs.Load()) / 1000
+}
 
 // Duration returns the track length in seconds.
 func (p *Player) Duration() float64 { return float64(p.durMs.Load()) / 1000 }
@@ -130,8 +150,14 @@ func (p *Player) loop() {
 		conv    *converter
 		base    int64 // absolute sample frame where decoding resumed
 		written int64 // frames written since the last reset
-		eof     bool
-		ending  bool
+		// lastMs keeps the reported position monotonic. Deriving it from
+		// "written - padding" lets it dip by up to one buffer period whenever
+		// the engine reports a padding larger than what we just queued, and a
+		// position that jumps backwards makes the lyric highlight flicker
+		// between two lines. It is reset on load and seek, never elsewhere.
+		lastMs int64
+		eof    bool
+		ending bool
 	)
 
 	cleanup := func() {
@@ -191,6 +217,9 @@ func (p *Player) loop() {
 					dec = nil
 					src = nil
 					payload = c.data
+					// Adopt the generation immediately: from this point on the
+					// position refers to the new track (zero until data flows).
+					p.activeGen.Store(c.gen)
 					if payload == nil {
 						continue
 					}
@@ -215,6 +244,7 @@ func (p *Player) loop() {
 						continue
 					}
 					p.posMs.Store(0)
+					lastMs = 0
 					p.playing.Store(true)
 					out.Start()
 				case cmdToggle:
@@ -270,7 +300,8 @@ func (p *Player) loop() {
 					eof = false
 					ending = false
 					if outRate > 0 {
-						p.posMs.Store(base * 1000 / int64(outRate))
+						lastMs = base * 1000 / int64(outRate)
+						p.posMs.Store(lastMs)
 					}
 					if wasPlaying {
 						out.Start()
@@ -332,13 +363,25 @@ func (p *Player) loop() {
 
 		// Position = decoded frames minus what is still queued. `rate` is the
 		// decode rate, outRate the rate the device is consuming at.
-		inflight := out.Padding()
-		frames := base + written - int64(inflight)
+		//
+		// The padding can momentarily exceed what we have written in this
+		// generation (device restarts, buffer re-use), which would make the
+		// estimate jump backwards. Clamp it and publish a monotonic value: a
+		// stuttering position is exactly what makes the lyric highlight bounce.
+		inflight := int64(out.Padding())
+		if inflight > written {
+			inflight = written
+		}
+		frames := base + written - inflight
 		if frames < 0 {
 			frames = 0
 		}
 		if outRate > 0 {
-			p.posMs.Store(frames * 1000 / int64(outRate))
+			ms := frames * 1000 / int64(outRate)
+			if ms > lastMs {
+				lastMs = ms
+				p.posMs.Store(ms)
+			}
 		}
 
 		if (eof || rerr != nil) && !ending {

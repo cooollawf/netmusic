@@ -74,6 +74,9 @@ const (
 // CoverSize is the album art edge length in physical pixels.
 func CoverSize() int32 { return dp(98) }
 
+// mainOwner is the main window handle; helper panels are created owned by it.
+var mainOwner uintptr
+
 // WMDispatch is posted by worker goroutines to run a closure on the UI thread.
 const WMDispatch = w32.WM_APP + 100
 
@@ -131,10 +134,16 @@ func NewMainWindow(ctl Controller) *MainWindow {
 		W:       w,
 		H:       h,
 		Style:   w32.WS_POPUP | w32.WS_SYSMENU | w32.WS_MINIMIZEBOX | w32.WS_CLIPCHILDREN,
-		ExStyle: 0x00000080, // WS_EX_TOOLWINDOW: no taskbar button, like TTPlayer's lyrics windows
+		// WS_EX_APPWINDOW is what puts the window in the taskbar and Alt+Tab.
+		// WS_POPUP windows get neither by default, and WS_EX_TOOLWINDOW (the
+		// value used for the helper panels) explicitly removes them.
+		ExStyle: w32.WS_EX_APPWINDOW,
 		Handler: mw,
 		Center:  true,
 	})
+	// Helper panels are owned by the main window: minimising it hides them and
+	// closing it takes them with it, instead of leaving orphan tool windows.
+	mainOwner = mw.hwnd
 	return mw
 }
 

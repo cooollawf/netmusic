@@ -32,11 +32,14 @@ func NewPanel(title string, w, h int32) *Panel {
 	p := &Panel{Title: title, W: w, H: h}
 	p.class = w32.RegisterClass(w32.CS_DBLCLKS, w32.LoadCursor(w32.IDC_ARROW))
 	p.HWnd = p.class.Create(w32.WindowSpec{
-		Title:   title,
-		W:       w,
-		H:       h,
-		Style:   w32.WS_POPUP | w32.WS_CLIPCHILDREN,
-		ExStyle: 0x00000080, // WS_EX_TOOLWINDOW
+		Title: title,
+		W:     w,
+		H:     h,
+		Style: w32.WS_POPUP | w32.WS_CLIPCHILDREN,
+		// Tool windows stay out of the taskbar; owning them to the main window
+		// makes them minimise and close together with it instead of lingering.
+		ExStyle: w32.WS_EX_TOOLWINDOW,
+		Owner:   mainOwner,
 		Handler: p,
 	})
 	return p

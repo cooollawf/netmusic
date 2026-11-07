@@ -105,7 +105,19 @@ func (lw *LyricsWindow) Tick(posMs int64) bool {
 	if lw.doc.Len() == 0 {
 		return false
 	}
+	// The viewport size is needed to centre the line; make sure it is current
+	// even if the window has not been painted yet.
+	lw.layout()
 	idx := lw.doc.IndexAt(posMs)
+	// Step forwards only. A small backwards step can only come from position
+	// jitter (the audio clock estimate wobbles by a few ms), and honouring it
+	// makes the highlight bounce between two lines - the reported "twitching".
+	// A real seek moves far enough to pass this check.
+	if idx >= 0 && lw.cur >= 0 && idx < lw.cur {
+		if back := lw.doc.Lines[lw.cur].Ms - posMs; back < 500 {
+			return false
+		}
+	}
 	if idx == lw.cur {
 		return false
 	}

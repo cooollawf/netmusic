@@ -75,6 +75,10 @@ func main() {
 		probeWASAPI()
 	case "dibtest":
 		probeDIB(os.Args[2])
+	case "posmono":
+		probePosMono(cl, os.Args[2])
+	case "posgate":
+		probePosGate(cl, os.Args[2], os.Args[3])
 	case "qrtest":
 		probeQRImage(os.Args[2])
 	default:
@@ -156,6 +160,85 @@ func probeDIB(path string) {
 	writeBMP(path, px, w, h)
 	sum := md5.Sum(px)
 	fmt.Printf("wrote %s md5=%x\n", path, sum)
+}
+
+// probePosGate reproduces the "lyrics twitch on track change" condition:
+// lyrics arrive long before the new audio does, so for a while the UI asks for a
+// position that still belongs to the previous track. Position must report 0
+// until the new track is adopted.
+func probePosGate(cl *netease.Client, idA, idB string) {
+	load := func(idStr string) []byte {
+		id, _ := strconv.ParseInt(idStr, 10, 64)
+		u, _, err := cl.SongURL(id, 128000)
+		if err != nil {
+			fmt.Println("no url for", idStr, err)
+			return nil
+		}
+		data, err := download(u)
+		if err != nil {
+			fmt.Println("download:", err)
+			return nil
+		}
+		return data
+	}
+	a := load(idA)
+	b := load(idB)
+	if a == nil || b == nil {
+		return
+	}
+	pl := audio.NewPlayer()
+	pl.Load(a, 240)
+	time.Sleep(2500 * time.Millisecond)
+	fmt.Printf("A 播放 2.5s 后 position=%.2fs\n", pl.Position())
+	pl.Load(b, 240)
+	fmt.Printf("刚 Load B 时 position=%.2fs  (必须为 0，否则歌词会按旧时钟定位)\n", pl.Position())
+	time.Sleep(600 * time.Millisecond)
+	fmt.Printf("600ms 后 position=%.2fs\n", pl.Position())
+	pl.Close()
+}
+
+// probePosMono samples the playback position at a high rate and reports any
+// backwards step. Jittery positions are what make the lyric highlight bounce,
+// so this is the regression test for that bug.
+func probePosMono(cl *netease.Client, idStr string) {
+	id, _ := strconv.ParseInt(idStr, 10, 64)
+	u, _, err := cl.SongURL(id, 128000)
+	if err != nil {
+		fmt.Println("no url:", err)
+		return
+	}
+	data, err := download(u)
+	if err != nil {
+		fmt.Println("download:", err)
+		return
+	}
+	pl := audio.NewPlayer()
+	pl.Load(data, 240)
+	time.Sleep(400 * time.Millisecond)
+	var last float64
+	back := 0
+	maxBack := 0.0
+	samples := 0
+	start := time.Now()
+	for time.Since(start) < 4*time.Second {
+		pos := pl.Position()
+		if pos < last {
+			back++
+			if d := last - pos; d > maxBack {
+				maxBack = d
+			}
+		}
+		last = pos
+		samples++
+		time.Sleep(2 * time.Millisecond)
+	}
+	pl.Close()
+	fmt.Printf("samples=%d  backwards_steps=%d  worst=%.3fs  final=%.2fs\n", samples, back, maxBack, last)
+	if back == 0 {
+		fmt.Println("OK: position is monotonic")
+	} else {
+		fmt.Println("FAIL: position went backwards")
+	}
 }
 
 // writeBMP dumps a top-down 32bpp BGRA buffer as a BMP file.
