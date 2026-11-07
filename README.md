@@ -15,6 +15,16 @@
 ────────────────────────────────────────────────
 ```
 
+| 主控窗口 | 播放列表 |
+|---|---|
+| ![主控](docs/screenshots/main.png) | ![播放列表](docs/screenshots/playlist.png) |
+
+| 歌词 | 评论 | 登录 |
+|---|---|---|
+| ![歌词](docs/screenshots/lyrics.png) | ![评论](docs/screenshots/comments.png) | ![登录](docs/screenshots/login.png) |
+
+> 截图为实际运行画面（程序内 `PrintWindow` 抓取），非设计稿。
+
 ## 一、硬指标达成情况
 
 | 指标 | 要求 | 实测 | 结论 |
@@ -174,12 +184,27 @@ go build -trimpath -ldflags "-s -w" -o netmusic32.exe .\cmd\netmusic
 .\netmusic.exe -no-gc-limit         # 关闭 64MB 软堆上限（用于对比测量）
 ```
 
+### 代理（可选）
+
+`music.163.com` 在国内**直连即可**，因此默认直连，不读系统代理。如果你的网络环境必须走代理，
+在 `%APPDATA%\netmusic\config.json` 里设置 `"proxy"`：
+
+```jsonc
+{
+  "proxy": "system"                    // 读取 Clash/v2ray 写入的 WinINET 系统代理
+  // "proxy": "http://127.0.0.1:7890"   // 或直接指定
+  // "proxy": "env"                     // 或读 HTTPS_PROXY 环境变量
+}
+```
+
+改完重启生效。用 `.\nmprobe.exe proxy` 可以查看当前解析结果。
+
 ## 六、内存是怎么省下来的
 
 | 手段 | 效果 |
 |---|---|
 | 不用 WebView / Qt / GTK | 省掉 60–150MB |
-| 手写 Win32 + 自绘，只缓存画刷/画笔/字体 | 空窗口整进程 12.2MB |
+| 手写 Win32 + 自绘，只缓存画刷/画笔/字体 | 最小空窗口整进程 12.2 MB（不含网络/音频代码） |
 | 不使用 GDI+ / WIC，图片用 `image/jpeg` 解码后直接进 32bpp DIB | 不加载系统图像框架 |
 | 音频只驻留**压缩后的整曲**（1–3MB），按需解码到设备缓冲 | 比"全曲预解码成 PCM"省 50MB/首 |
 | WASAPI `AUTOCONVERTPCM` 交给系统重采样 | 不写重采样代码、无额外缓冲 |

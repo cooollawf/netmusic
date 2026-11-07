@@ -284,10 +284,22 @@ func (mw *MainWindow) OnCreate(hwnd uintptr) bool {
 func (mw *MainWindow) OnDestroy(hwnd uintptr) {
 	w32.KillTimer(hwnd, 1)
 	mw.buf.Free()
+	// Safety net: if the window is destroyed by any path other than the ✕
+	// button (Alt+F4, taskbar close, WM_CLOSE), the message loop must still
+	// end — otherwise the process would linger forever with no window.
+	w32.PostQuitMessage()
 }
 
 func (mw *MainWindow) OnMessage(hwnd uintptr, msg uint32, wp, lp uintptr) (bool, uintptr) {
 	switch msg {
+	case w32.WM_CLOSE:
+		// Route Alt+F4 / taskbar close through the same path as ✕ so the
+		// session (cookies, volume, geometry) gets persisted.
+		if mw.OnQuit != nil {
+			mw.OnQuit()
+			return true, 0
+		}
+		return false, 0
 	case w32.WM_NCHITTEST:
 		// Let Windows do the dragging/snapping for the title strip.
 		x := int32(int16(lp & 0xffff))
