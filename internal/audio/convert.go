@@ -20,6 +20,7 @@ type converter struct {
 	n       int     // valid samples in buf
 	frac    float64 // fractional read position, in source frames
 	staging []byte
+	eq      *EQ
 	scratch []int16
 	eof     bool
 }
@@ -99,6 +100,9 @@ func (c *converter) fill(dec io.Reader, avail int, dst []byte, vol int) (bool, e
 			f := pos - float64(i0)
 			l = int16(lerp16(c.buf[i0*2], c.buf[i1*2], f) * gain / 10000)
 			r = int16(lerp16(c.buf[i0*2+1], c.buf[i1*2+1], f) * gain / 10000)
+		}
+		if c.eq != nil && c.eq.Active() {
+			l, r = c.eq.ProcessFrame(l, r)
 		}
 		c.writeFrame(dst[o:], l, r)
 		o += c.dev.BlockAlign

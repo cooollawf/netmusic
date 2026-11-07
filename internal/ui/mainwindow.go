@@ -49,6 +49,7 @@ const (
 	actComment
 	actCover
 	actAccount
+	actSettings
 )
 
 // Exported action ids so the application layer can react to the custom
@@ -69,6 +70,7 @@ const (
 	ActComment  = actComment
 	ActCover    = actCover
 	ActAccount  = actAccount
+	ActSettings = actSettings
 )
 
 // CoverSize is the album art edge length in physical pixels.
@@ -96,11 +98,11 @@ type mainLayout struct {
 	Play      w32.RECT
 	Next      w32.RECT
 	Mode      w32.RECT
-	VolIcon   w32.RECT
 	VolSlider w32.RECT
 	ChipList  w32.RECT
 	ChipLyric w32.RECT
 	ChipComm  w32.RECT
+	ChipCfg   w32.RECT
 }
 
 // MainWindow is the TTPlayer style 主控窗口: frameless, custom painted, with
@@ -193,13 +195,16 @@ func (mw *MainWindow) layout() mainLayout {
 	l.Play = rc(ix + dp(28), ry - dp(2), ix + dp(28) + dp(30), ry + dp(28))
 	l.Next = rc(ix + dp(60), ry, ix + dp(60) + dp(26), ry + dp(26))
 	l.Mode = rc(ix + dp(90), ry + dp(4), ix + dp(90) + dp(22), ry + dp(22))
-	l.VolIcon = rc(ix + dp(116), ry + dp(4), ix + dp(116) + dp(14), ry + dp(22))
-	l.VolSlider = rc(ix + dp(132), ry + dp(4), ix + dp(132) + dp(52), ry + dp(22))
+	// The speaker glyph was dropped so the slider can sit further left: four
+	// chips (列表/歌词/评论/设置) now need the right side of this row.
+	l.VolSlider = rc(ix + dp(116), ry + dp(4), ix + dp(116) + dp(38), ry + dp(22))
 
 	// right chips
-	chw, chh := dp(34), dp(20)
+	chw, chh := dp(32), dp(20)
 	chy := dp(123)
 	x := w - dp(8) - chw
+	l.ChipCfg = rc(x, chy, x + chw, chy + chh)
+	x -= chw + dp(3)
 	l.ChipComm = rc(x, chy, x + chw, chy + chh)
 	x -= chw + dp(3)
 	l.ChipLyric = rc(x, chy, x + chw, chy + chh)
@@ -241,6 +246,8 @@ func (mw *MainWindow) hit(x, y int32) int {
 		return actLyric
 	case inRect(l.ChipComm, x, y):
 		return actComment
+	case inRect(l.ChipCfg, x, y):
+		return actSettings
 	}
 	if inRect(l.Progress, x, y) || inRect(l.Time, x, y) {
 		return actProgress
@@ -440,6 +447,7 @@ func (mw *MainWindow) OnPaint(hwnd uintptr, hdc w32.HDC, client w32.RECT) {
 		return
 	}
 	mw.draw(bdc, w, h)
+	tryCapture("主控", mw.buf.DIB())
 	mw.buf.Flush(hdc, w, h)
 	_ = bw
 	_ = bh
@@ -529,7 +537,6 @@ func (mw *MainWindow) draw(dc w32.HDC, w, h int32) {
 	drawTextIn(dc, l.Mode, modeText, textOpt{Font: T.FontXS, Color: T.TextDim, Align: w32.DT_CENTER})
 
 	// volume
-	iconSpeaker(dc, l.VolIcon, T.TextDim)
 	vr := l.VolSlider
 	vy := vr.Top + vr.Dy()/2
 	fillXY(dc, vr.Left, vy-dp(1), vr.Dx(), dp(2), T.TrackBg)
@@ -542,6 +549,7 @@ func (mw *MainWindow) draw(dc w32.HDC, w, h int32) {
 	mw.drawChip(dc, l.ChipList, actList, "列表")
 	mw.drawChip(dc, l.ChipLyric, actLyric, "歌词")
 	mw.drawChip(dc, l.ChipComm, actComment, "评论")
+	mw.drawChip(dc, l.ChipCfg, actSettings, "设置")
 }
 
 func (mw *MainWindow) drawBtn(dc w32.HDC, r w32.RECT, act int, icon func(w32.HDC, w32.RECT, uint32)) {

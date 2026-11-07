@@ -81,6 +81,8 @@ func main() {
 		probePosGate(cl, os.Args[2], os.Args[3])
 	case "qrtest":
 		probeQRImage(os.Args[2])
+	case "eqbench":
+		probeEQBench(cl, os.Args[2])
 	default:
 		usage()
 	}
@@ -160,6 +162,57 @@ func probeDIB(path string) {
 	writeBMP(path, px, w, h)
 	sum := md5.Sum(px)
 	fmt.Printf("wrote %s md5=%x\n", path, sum)
+}
+
+// probeEQBench measures what the 10 band equaliser costs in CPU, which is the
+// question that matters on a Core 2 era laptop. It processes the whole track
+// once with every band active and once bypassed.
+func probeEQBench(cl *netease.Client, idStr string) {
+	id, _ := strconv.ParseInt(idStr, 10, 64)
+	u, _, err := cl.SongURL(id, 128000)
+	if err != nil {
+		fmt.Println("no url:", err)
+		return
+	}
+	data, err := download(u)
+	if err != nil {
+		fmt.Println("download:", err)
+		return
+	}
+	dec, err := mp3.NewDecoder(bytes.NewReader(data))
+	if err != nil {
+		fmt.Println("decoder:", err)
+		return
+	}
+	pcm, _ := io.ReadAll(dec)
+	seconds := float64(len(pcm)) / 176400
+	fmt.Printf("pcm=%d bytes (%.1fs)\n", len(pcm), seconds)
+
+	var gains [audio.EQBands]int8
+	for i := range gains {
+		if i%2 == 0 {
+			gains[i] = 6
+		} else {
+			gains[i] = -6
+		}
+	}
+	buf := make([]byte, len(pcm))
+	copy(buf, pcm)
+
+	eq := &audio.EQ{}
+	eq.Configure(gains, true, 44100)
+	t0 := time.Now()
+	eq.Process(buf)
+	eqCost := time.Since(t0)
+
+	off := &audio.EQ{}
+	off.Configure(gains, false, 44100)
+	t1 := time.Now()
+	off.Process(buf)
+	bypass := time.Since(t1)
+
+	fmt.Printf("eq 10 bands : %v => %.0fx realtime\n", eqCost, seconds/eqCost.Seconds())
+	fmt.Printf("eq bypassed : %v => %.0fx realtime\n", bypass, seconds/bypass.Seconds())
 }
 
 // probePosGate reproduces the "lyrics twitch on track change" condition:

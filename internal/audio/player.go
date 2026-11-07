@@ -28,6 +28,11 @@ type Player struct {
 	gen       atomic.Int64
 	activeGen atomic.Int64
 
+	// EQ state is owned by the audio goroutine; these two mirror the last
+	// requested settings so a newly opened stream can configure itself.
+	eqGains [EQBands]int8
+	eqOn    atomic.Bool
+
 	mu   sync.Mutex
 	note string // last state note, e.g. "缓冲中…" (UI reads it rarely)
 
@@ -45,6 +50,7 @@ const (
 	cmdSeek
 	cmdQuit
 	cmdVolume
+	cmdEQ
 )
 
 type command struct {
@@ -53,6 +59,8 @@ type command struct {
 	frac float64
 	vol  int
 	gen  int64
+	eqOn bool
+	eqGains [EQBands]int8
 }
 
 // NewPlayer creates the player and starts its goroutine.
@@ -91,6 +99,14 @@ func (p *Player) Toggle()      { p.post(command{kind: cmdToggle}) }
 func (p *Player) Play()        { p.post(command{kind: cmdPlay}) }
 func (p *Player) Pause()       { p.post(command{kind: cmdPause}) }
 func (p *Player) SeekFrac(f float64) { p.post(command{kind: cmdSeek, frac: f}) }
+
+// SetEQ applies an equaliser setting. gains are dB per band (-12..+12);
+// the audio goroutine owns the filter state, so this only posts a command.
+func (p *Player) SetEQ(gains [EQBands]int8, enabled bool) {
+	p.eqGains = gains
+	p.eqOn.Store(enabled)
+	p.post(command{kind: cmdEQ, eqOn: enabled, eqGains: gains})
+}
 
 func (p *Player) SetVolume(v int) {
 	if v < 0 {
@@ -148,6 +164,7 @@ func (p *Player) loop() {
 		rate    int      // decoder sample rate
 		outRate int      // rate the device consumes at (== rate on the fast path)
 		conv    *converter
+		eq      *EQ
 		base    int64 // absolute sample frame where decoding resumed
 		written int64 // frames written since the last reset
 		// lastMs keeps the reported position monotonic. Deriving it from
@@ -179,11 +196,16 @@ func (p *Player) loop() {
 		}
 		out = o
 		outRate = sampleRate
+		if eq == nil {
+			eq = &EQ{}
+		}
 		if !o.Autoconvert {
 			// The engine would not convert for us; do it in software.
 			conv = newConverter(o.Dev, sampleRate)
+			conv.eq = eq
 			outRate = o.Dev.Rate
 		}
+		eq.Configure(p.eqGains, p.eqOn.Load(), outRate)
 		return nil
 	}
 
@@ -194,6 +216,9 @@ func (p *Player) loop() {
 		}
 		if conv != nil {
 			conv.reset()
+		}
+		if eq != nil {
+			eq.Reset()
 		}
 		written = 0
 		eof = false
@@ -306,6 +331,10 @@ func (p *Player) loop() {
 					if wasPlaying {
 						out.Start()
 					}
+				case cmdEQ:
+					if eq != nil {
+						eq.Configure(c.eqGains, c.eqOn, outRate)
+					}
 				case cmdVolume:
 					// volume lives in an atomic; nothing to do here
 				}
@@ -357,6 +386,7 @@ func (p *Player) loop() {
 				eof = true
 			}
 			applyGain(buf[:n], int(p.vol.Load()))
+			eq.Process(buf[:n])
 		}
 		out.Release(avail)
 		written += int64(avail)

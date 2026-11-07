@@ -11,6 +11,8 @@ package w32
 import (
 	"errors"
 	"image"
+	"image/png"
+	"os"
 	"syscall"
 	"unsafe"
 )
@@ -608,6 +610,37 @@ func (d *DIB) Blit(dst HDC, x, y int32) {
 		return
 	}
 	BLT(dst, x, y, d.W, d.H, d.DC, 0, 0)
+}
+
+// SavePNG writes the DIB contents to a PNG file.
+//
+// This is how the player proves what it actually painted on a remote machine:
+// the buffer is dumped straight after a paint, so the result matches what the
+// user sees and is immune to occlusion and to PrintWindow's version differences
+// (PW_RENDERFULLCONTENT only exists on Windows 8+).
+func (d *DIB) SavePNG(path string) error {
+	if d == nil || d.Bits == nil || d.W <= 0 || d.H <= 0 {
+		return errors.New("dib: empty")
+	}
+	px := d.PixelPtr()
+	img := image.NewNRGBA(image.Rect(0, 0, int(d.W), int(d.H)))
+	for y := 0; y < int(d.H); y++ {
+		src := y * int(d.Stride)
+		dst := y * img.Stride
+		for x := 0; x < int(d.W); x++ {
+			o := src + x*4
+			img.Pix[dst+x*4+0] = px[o+2] // R
+			img.Pix[dst+x*4+1] = px[o+1] // G
+			img.Pix[dst+x*4+2] = px[o+0] // B
+			img.Pix[dst+x*4+3] = 0xFF
+		}
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return png.Encode(f, img)
 }
 
 func DeleteBitmap(b HBITMAP) { DeleteObject(HGDIOBJ(b)) }

@@ -13,6 +13,7 @@ type LyricsWindow struct {
 	doc  *lrc.Doc
 
 	cur        int
+	twoLine    bool // document carries translations
 	title      string
 	userScroll uint64 // tick until which auto-centering is suppressed
 	autoFollow bool
@@ -26,7 +27,14 @@ func NewLyricsWindow() *LyricsWindow {
 	lw := &LyricsWindow{cur: -1, autoFollow: true}
 	lw.Panel = NewPanel("歌词", dp(400), dp(330))
 	lw.list = NewListView()
-	lw.list.RowH = func() int32 { return dp(34) }
+	lw.list.RowH = func() int32 {
+		// Bilingual documents get a taller row so the original and the
+		// translation each own half of it instead of overlapping.
+		if lw.twoLine {
+			return dp(48)
+		}
+		return dp(34)
+	}
 	lw.list.Count = func() int { return lw.doc.Len() }
 	lw.list.Draw = lw.drawLine
 	lw.list.OnActivate = func(idx int) { lw.seekTo(idx) }
@@ -40,6 +48,7 @@ func (lw *LyricsWindow) SetDoc(doc *lrc.Doc, title string) {
 	lw.doc = doc
 	lw.title = title
 	lw.cur = -1
+	lw.twoLine = doc != nil && doc.HasTrans
 	lw.Panel.Title = "歌词 — " + title
 	lw.list.Sel = -1
 	lw.list.Top = 0
@@ -81,12 +90,32 @@ func (lw *LyricsWindow) drawLine(dc w32.HDC, idx int, r w32.RECT, st ListState) 
 			break
 		}
 	}
+	if lw.twoLine {
+		// Bilingual row: the original owns the top half, the translation the
+		// bottom half. Previously both were drawn into the same 34 px row with a
+		// 14 px offset, so a foreign-language line and its Chinese translation
+		// overlapped each other.
+		mainRect := rc(r.Left, r.Top+dp(1), r.Right, r.Top+dp(27))
+		transRect := rc(r.Left, r.Top+dp(25), r.Right, r.Bottom-dp(1))
+		if cur {
+			drawTextIn(dc, mainRect, main, textOpt{Font: T.FontL, Color: T.Accent, Align: w32.DT_CENTER})
+			if trans != "" {
+				drawTextIn(dc, transRect, trans, textOpt{Font: T.FontXS, Color: T.AccentDark, Align: w32.DT_CENTER})
+			}
+			return
+		}
+		c := T.TextMid
+		if st.Hover {
+			c = T.TextHi
+		}
+		drawTextIn(dc, mainRect, main, textOpt{Font: T.FontS, Color: c, Align: w32.DT_CENTER})
+		if trans != "" {
+			drawTextIn(dc, transRect, trans, textOpt{Font: T.FontXS, Color: T.TextDim, Align: w32.DT_CENTER})
+		}
+		return
+	}
 	if cur {
 		drawTextIn(dc, r, main, textOpt{Font: T.FontL, Color: T.Accent, Align: w32.DT_CENTER})
-		if trans != "" {
-			r2 := rc(r.Left, r.Top + dp(14), r.Right, r.Bottom)
-			drawTextIn(dc, r2, trans, textOpt{Font: T.FontXS, Color: T.AccentDark, Align: w32.DT_CENTER})
-		}
 		return
 	}
 	c := T.TextMid
@@ -94,10 +123,6 @@ func (lw *LyricsWindow) drawLine(dc w32.HDC, idx int, r w32.RECT, st ListState) 
 		c = T.TextHi
 	}
 	drawTextIn(dc, r, main, textOpt{Font: T.FontS, Color: c, Align: w32.DT_CENTER})
-	if trans != "" {
-		r2 := rc(r.Left, r.Top + dp(13), r.Right, r.Bottom)
-		drawTextIn(dc, r2, trans, textOpt{Font: T.FontXS, Color: T.TextDim, Align: w32.DT_CENTER})
-	}
 }
 
 // Tick advances the highlight. Called from the app's 250 ms UI timer.

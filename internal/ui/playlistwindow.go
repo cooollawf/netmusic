@@ -41,12 +41,14 @@ type PlaylistWindow struct {
 	btnUp       w32.RECT
 	btnDown     w32.RECT
 	btnDel      w32.RECT
+	btnDownload w32.RECT
 	hoverBtn    int
 
 	OnPlaylistSelect func(idx int)
 	OnTrackActivate  func(idx int)
 	OnSearch         func(keyword string)
 	OnQueueAction    func(kind int) // 0=up 1=down 2=remove
+	OnDownload       func(idx int)
 }
 
 func NewPlaylistWindow() *PlaylistWindow {
@@ -107,6 +109,7 @@ func (pw *PlaylistWindow) layout() {
 	pw.btnUp = rc(rx + dp(70), by, rx + dp(70) + dp(46), by + dp(20))
 	pw.btnDown = rc(rx + dp(120), by, rx + dp(120) + dp(46), by + dp(20))
 	pw.btnDel = rc(rx + dp(170), by, rx + dp(170) + dp(46), by + dp(20))
+	pw.btnDownload = rc(rx + dp(222), by, rx + dp(222) + dp(46), by + dp(20))
 	_ = hdr
 	_ = rw
 }
@@ -204,6 +207,7 @@ func (pw *PlaylistWindow) body(dc w32.HDC, client w32.RECT) {
 		textOpt{Font: T.FontXS, Color: T.TextMid})
 
 	drawChip(dc, pw.btnAddQueue, "加入队列", pw.hoverBtn == 2, false)
+	drawChip(dc, pw.btnDownload, "下载", pw.hoverBtn == 6, false)
 	if pw.inQueue {
 		drawChip(dc, pw.btnUp, "上移", pw.hoverBtn == 3, false)
 		drawChip(dc, pw.btnDown, "下移", pw.hoverBtn == 4, false)
@@ -272,6 +276,8 @@ func (pw *PlaylistWindow) hitBtn(x, y int32) int {
 		return 1
 	case inRect(pw.btnAddQueue, x, y):
 		return 2
+	case inRect(pw.btnDownload, x, y):
+		return 6
 	}
 	if pw.inQueue {
 		switch {
@@ -356,6 +362,10 @@ func (pw *PlaylistWindow) onMsg(msg uint32, wp, lp uintptr) (bool, uintptr) {
 		case 5:
 			if pw.OnQueueAction != nil {
 				pw.OnQueueAction(2)
+			}
+		case 6:
+			if pw.songs.Sel >= 0 && pw.OnDownload != nil {
+				pw.OnDownload(pw.songs.Sel)
 			}
 		}
 		w32.Invalidate(pw.HWnd)

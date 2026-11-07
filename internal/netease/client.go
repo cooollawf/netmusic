@@ -95,6 +95,52 @@ func NewClient(hc *http.Client) *Client {
 	return &Client{HTTP: hc, cookies: map[string]string{}}
 }
 
+// flexBool decodes a JSON field that the API sends as a bool in some responses
+// and as a number in others.
+//
+// This is not hypothetical: /api/nuser/account/get returns
+//
+//	"vipType": 11
+//
+// and declaring the field as bool made the whole profile decode fail, which the
+// app then reported as "login failed" even though the QR login had succeeded
+// (state 803, cookies set). One mistyped field must never be able to break
+// login again, so every boolean-ish field of an untrusted response goes through
+// this type.
+type flexBool bool
+
+func (b *flexBool) UnmarshalJSON(data []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(data)), `"`)
+	switch s {
+	case "", "null", "false", "0", "0.0":
+		*b = false
+	default:
+		*b = true
+	}
+	return nil
+}
+
+// flexInt decodes a JSON integer that may arrive as a quoted string or float.
+type flexInt int64
+
+func (n *flexInt) UnmarshalJSON(data []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(data)), `"`)
+	if s == "" || s == "null" {
+		*n = 0
+		return nil
+	}
+	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+		*n = flexInt(i)
+		return nil
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		*n = flexInt(int64(f))
+		return nil
+	}
+	*n = 0
+	return nil
+}
+
 // LoginError carries the NetEase status code so the UI can give an actionable
 // hint instead of a raw number.
 type LoginError struct {
@@ -432,7 +478,7 @@ func (c *Client) login(data map[string]any) (*Profile, error) {
 			UserID   int64  `json:"userId"`
 			Nickname string `json:"nickname"`
 			Avatar   string `json:"avatarUrl"`
-			VIP      bool   `json:"vipType"`
+			VIP      flexBool `json:"vipType"`
 		} `json:"profile"`
 		Account *struct {
 			ID int64 `json:"id"`
@@ -452,7 +498,7 @@ func (c *Client) login(data map[string]any) (*Profile, error) {
 		UserID:   out.Profile.UserID,
 		Nickname: out.Profile.Nickname,
 		Avatar:   out.Profile.Avatar,
-		VIP:      out.Profile.VIP,
+		VIP:      bool(out.Profile.VIP),
 	}
 	c.cacheProfile(p)
 	return p, nil
@@ -510,7 +556,7 @@ func (c *Client) Account() (*Profile, error) {
 			UserID   int64  `json:"userId"`
 			Nickname string `json:"nickname"`
 			Avatar   string `json:"avatarUrl"`
-			VIP      bool   `json:"vipType"`
+			VIP      flexBool `json:"vipType"`
 		} `json:"profile"`
 	}
 	if err := c.doPost("/api/nuser/account/get", url.Values{}, &out); err != nil {
@@ -519,7 +565,7 @@ func (c *Client) Account() (*Profile, error) {
 	if out.Profile == nil || out.Profile.UserID == 0 {
 		return nil, nil
 	}
-	p := &Profile{UserID: out.Profile.UserID, Nickname: out.Profile.Nickname, Avatar: out.Profile.Avatar, VIP: out.Profile.VIP}
+	p := &Profile{UserID: out.Profile.UserID, Nickname: out.Profile.Nickname, Avatar: out.Profile.Avatar, VIP: bool(out.Profile.VIP)}
 	c.cacheProfile(p)
 	return p, nil
 }

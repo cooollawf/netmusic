@@ -769,3 +769,6 @@ func (b *BackBuffer) Free() {
 		b.dib = nil
 	}
 }
+
+// DIB exposes the back buffer surface (used by the remote snapshot support).
+func (b *BackBuffer) DIB() *DIB { return b.dib }

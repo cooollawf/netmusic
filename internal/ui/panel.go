@@ -132,6 +132,7 @@ func (p *Panel) OnPaint(hwnd uintptr, hdc w32.HDC, client w32.RECT) {
 	if p.Body != nil {
 		p.Body(bdc, rc(0, tb.Bottom, w, h))
 	}
+	tryCapture(p.Title, p.buf.DIB())
 	p.buf.Flush(hdc, w, h)
 }
 

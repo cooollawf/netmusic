@@ -16,6 +16,9 @@ type Line struct {
 // Doc is a parsed lyric file.
 type Doc struct {
 	Lines []Line
+	// HasTrans is true when at least one line carries a translation, so the UI
+	// knows it needs two text lines per row.
+	HasTrans bool
 }
 
 // Parse accepts the NetEase LRC text, with optional translation text merged in
@@ -34,14 +37,17 @@ func Parse(raw, translated string) *Doc {
 	}
 	d.Lines = parseLines(raw)
 	if len(tr) > 0 {
+		merged := false
 		out := d.Lines[:0]
 		for _, ln := range d.Lines {
 			if t, ok := tr[ln.Ms]; ok && t != "" && t != ln.Text {
 				ln.Text = ln.Text + "\n" + t
+				merged = true
 			}
 			out = append(out, ln)
 		}
 		d.Lines = out
+		d.HasTrans = merged
 	}
 	return d
 }

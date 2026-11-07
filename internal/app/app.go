@@ -40,6 +40,7 @@ type App struct {
 	lyr   *ui.LyricsWindow
 	comm  *ui.CommentsWindow
 	login *ui.LoginWindow
+	settings *ui.SettingsWindow
 
 	uiQ chan func()
 
@@ -63,6 +64,8 @@ type App struct {
 	lyricFor int64
 
 	commSong int64
+	status   string
+	statusAt time.Time
 	loginGen atomic.Int32
 	profile  *netease.Profile
 
@@ -71,6 +74,11 @@ type App struct {
 	SelfTest      bool
 	SelfTestStage int
 	SoakRounds    int
+	// SelfTestQuery overrides the selftest search keyword (e.g. a foreign song
+	// with a Chinese translation, to check the bilingual lyric layout).
+	SelfTestQuery string
+	shotDir       string
+	shotN         int
 }
 
 // New builds the app and all of its windows.
@@ -101,12 +109,16 @@ func New() *App {
 	a.lyr = ui.NewLyricsWindow()
 	a.comm = ui.NewCommentsWindow()
 	a.login = ui.NewLoginWindow()
+	a.settings = ui.NewSettingsWindow()
 	a.list.Cascade = 0
 	a.lyr.Cascade = 1
 	a.comm.Cascade = 2
 	a.login.Cascade = 3
+	a.settings.Cascade = 4
 
 	a.wire()
+	a.wireSettings()
+	a.applyEQ()
 
 	a.pl.SetOnEnd(func() { a.post(a.advanceAuto) })
 	a.pl.SetOnError(func(err error) {
@@ -118,10 +130,21 @@ func New() *App {
 	return a
 }
 
+// SetShotDir makes the app dump its windows to PNGs at every measurement point
+// (used for remote verification on the Windows 7 box).
+func (a *App) SetShotDir(dir string) {
+	a.shotDir = dir
+	if dir != "" {
+		_ = os.MkdirAll(dir, 0o755)
+		Logf("snapshot dir: %s", dir)
+	}
+}
+
 // Run shows the main window, restores the session and pumps messages.
 func (a *App) Run() int {
 	a.Main.Show()
 	a.updateAccountLabel()
+	Logf("windows created")
 	go a.bootstrap()
 	if a.SelfTest {
 		go a.runSelfTest()
@@ -129,7 +152,33 @@ func (a *App) Run() int {
 	if a.SoakRounds > 0 {
 		go a.runSoak(a.SoakRounds)
 	}
+	if a.shotDir != "" && !a.SelfTest && a.SoakRounds == 0 {
+		go a.shotLoop()
+	}
 	return w32.RunMessageLoop()
+}
+
+// shotLoop keeps dumping the windows while the app is used normally, so a
+// remote session leaves a rolling trail of what is actually on screen.
+func (a *App) shotLoop() {
+	for {
+		time.Sleep(15 * time.Second)
+		select {
+		case a.uiQ <- func() { ui.Snapshot(a.shotDir, "auto") }:
+			w32.PostMessage(a.Main.HWND(), ui.WMDispatch, 0, 0)
+		default:
+		}
+	}
+}
+
+// searchQuery returns the keyword the selftest/soak should use. A foreign song
+// is the quickest way to check the bilingual lyric layout, so -query exists.
+func (a *App) searchQuery() string {
+	if a.SelfTestQuery != "" {
+		Logf("selftest query=%q", a.SelfTestQuery)
+		return a.SelfTestQuery
+	}
+	return "卡农 钢琴"
 }
 
 // runSelfTest exercises search -> resolve -> download -> decode -> WASAPI plus
@@ -140,7 +189,7 @@ func (a *App) runSelfTest() {
 	time.Sleep(700 * time.Millisecond)
 	a.memLog("stage0: 主窗口就绪")
 
-	tracks, err := a.cl.Search("卡农 钢琴", 8)
+	tracks, err := a.cl.Search(a.searchQuery(), 8)
 	if err != nil || len(tracks) == 0 {
 		a.memLog("search failed: " + friendly(err))
 		return
@@ -255,6 +304,17 @@ func (a *App) memLog(label string) {
 		float64(ms.Sys)/1048576,
 		gdi, user,
 	)
+	Logf("MEM %s WS=%.2fMB Priv=%.2fMB Heap=%.2fMB GDI=%d USER=%d",
+		label, float64(ws)/1048576, float64(priv)/1048576,
+		float64(ms.HeapAlloc)/1048576, gdi, user)
+	// Snapshot every window at each measurement point so a remote run leaves
+	// visual evidence behind.
+	if a.shotDir != "" {
+		a.shotN++
+		tag := fmt.Sprintf("%02d", a.shotN)
+		a.post(func() { ui.Snapshot(a.shotDir, tag) })
+		time.Sleep(350 * time.Millisecond) // let the paint happen before returning
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +375,8 @@ func (a *App) Track() ui.TrackInfo {
 		ti.Album = a.loadNote
 	} else if a.playError != "" {
 		ti.Album = a.playError
+	} else if a.status != "" && time.Since(a.statusAt) < 8*time.Second {
+		ti.Album = a.status
 	}
 	return ti
 }
@@ -613,6 +675,8 @@ func (a *App) onAction(act int) {
 		a.toggleLyrics()
 	case ui.ActComment:
 		a.toggleComments()
+	case ui.ActSettings:
+		a.openSettings()
 	case ui.ActAccount:
 		a.openLogin()
 	case ui.ActCover:
@@ -669,8 +733,19 @@ func (a *App) toggleComments() {
 func (a *App) bootstrap() {
 	// Warm the session up first: this is what makes the server treat us as a
 	// returning client instead of a brand new one (and hands out __csrf).
-	_ = a.cl.Warmup()
+	if err := a.cl.Warmup(); err != nil {
+		Logf("warmup failed: %v", err)
+	} else {
+		Logf("warmup ok, cookies=%d", len(a.cl.Cookies()))
+	}
 	prof, err := a.cl.Account()
+	if err != nil {
+		Logf("account error: %v", err)
+	} else if prof == nil {
+		Logf("account: not logged in")
+	} else {
+		Logf("account: uid=%d nick=%s", prof.UserID, prof.Nickname)
+	}
 	a.post(func() {
 		if err != nil || prof == nil {
 			a.profile = nil
@@ -847,6 +922,12 @@ func (a *App) wire() {
 		}
 	}
 
+	a.list.OnDownload = func(idx int) {
+		if idx >= 0 && idx < len(a.viewTracks) {
+			a.downloadTrack(a.viewTracks[idx])
+		}
+	}
+
 	a.lyr.OnSeek = func(frac float64) { a.Seek(frac) }
 	a.lyr.Duration = func() float64 { return a.Duration() }
 	a.lyr.Position = func() float64 { return a.pl.Position() }
@@ -948,6 +1029,11 @@ func (a *App) requestQR() {
 	go func() {
 		key, url, err := a.cl.QRKey()
 		if err != nil {
+			Logf("qr key failed: %v", err)
+		} else {
+			Logf("qr key ok: %s", key)
+		}
+		if err != nil {
 			a.post(func() { a.login.SetQRState("获取二维码失败：" + friendly(err)) })
 			return
 		}
@@ -979,6 +1065,7 @@ func (a *App) pollQR(key string, gen int32) {
 			a.post(func() { a.login.SetQRState("轮询失败：" + friendly(err)) })
 			return
 		}
+		Logf("qr poll state=%d", st)
 		switch st {
 		case 800:
 			a.post(func() { a.login.SetQRState("二维码已过期，请刷新") })
@@ -1090,21 +1177,55 @@ func loginHint(err error) string {
 	return friendly(err)
 }
 
+// afterLogin validates the freshly obtained session and loads the account.
+//
+// The right-after-scan window matters: the server accepts MUSIC_U on the QR
+// poll response but /api/nuser/account/get can still answer "not logged in" for
+// a fraction of a second (session propagation). The old code checked once and
+// declared failure, which is exactly what the Windows 7 config file showed:
+// MUSIC_U saved, no uid/nickname, "login looks broken". So retry.
 func (a *App) afterLogin() {
-	prof, err := a.cl.Account()
+	Logf("afterLogin: cookies=%d", len(a.cl.Cookies()))
+	var prof *netease.Profile
+	var err error
+	for attempt := 1; attempt <= 5; attempt++ {
+		prof, err = a.cl.Account()
+		Logf("afterLogin account attempt %d: prof=%v err=%v", attempt, prof != nil, err)
+		if prof != nil {
+			break
+		}
+		if !a.hasSessionCookie() {
+			Logf("afterLogin: no MUSIC_U cookie, giving up")
+			break
+		}
+		time.Sleep(600 * time.Millisecond)
+	}
 	a.post(func() {
-		if err != nil || prof == nil {
-			a.login.SetStatus("登录状态校验失败", false)
+		if prof == nil {
+			// Keep the cookie: the session is probably fine and the next start
+			// will pick it up. Tell the user honestly instead of pretending.
+			msg := "已获取登录凭据，但账号校验未通过"
+			if err != nil {
+				msg = "账号校验失败：" + friendly(err)
+			}
+			a.login.SetStatus(msg+"（重启程序可自动重试）", false)
 			return
 		}
 		a.profile = prof
 		a.cfg.UID = prof.UserID
 		a.cfg.Nickname = prof.Nickname
 		a.cfg.SetCookies(a.cl.Cookies())
+		_ = a.cfg.Save()
 		a.updateAccountLabel()
 		a.login.Hide()
 		go a.loadPlaylists()
 	})
+}
+
+// hasSessionCookie reports whether a login cookie is present.
+func (a *App) hasSessionCookie() bool {
+	_, ok := a.cl.Cookies()["MUSIC_U"]
+	return ok
 }
 
 // ---------------------------------------------------------------------------
