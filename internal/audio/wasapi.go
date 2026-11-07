@@ -34,7 +34,9 @@ const (
 	eRender  = 0
 	eConsole = 0
 
-	waveFormatPCM = 1
+	waveFormatPCM  = 1
+	waveFormatIEEE = 3
+	waveFormatExtensible = 0xFFFE
 )
 
 type guid struct {
@@ -136,6 +138,14 @@ type AudioOut struct {
 	Channels     int
 	BytesPerFrame int
 
+	// Autoconvert is true when the audio engine converts our 16-bit PCM to the
+	// endpoint format (AUTOCONVERTPCM). When it is false we opened the stream
+	// with the endpoint's own mix format and Dev tells the player how to
+	// convert samples itself — the Windows 7 safety net for drivers that reject
+	// the auto-convert path.
+	Autoconvert bool
+	Dev         DevFormat
+
 	// wf lives in the heap-owned AudioOut so its address stays valid even if
 	// the goroutine stack moves while the call is being prepared.
 	wf waveFormatEx
@@ -144,6 +154,20 @@ type AudioOut struct {
 	started bool
 	coInit  bool
 }
+
+// DevFormat describes an endpoint mix format.
+type DevFormat struct {
+	Rate       int
+	Channels   int
+	Bits       int
+	IsFloat    bool
+	BlockAlign int
+}
+
+// ForceMixFormat disables the AUTOCONVERTPCM path so the manual sample
+// conversion can be exercised on machines where auto-convert works
+// (-force-audio-fallback, and nmprobe wasapi).
+var ForceMixFormat bool
 
 // OpenStream initialises a shared-mode stream expecting interleaved 16-bit PCM
 // at the given rate. Windows converts (AUTOCONVERTPCM) to the device mix
@@ -156,6 +180,7 @@ func OpenStream(sampleRate, channels int) (*AudioOut, error) {
 		return nil, hresult(hr)
 	}
 
+	tracef("OpenStream rate=%d forceMix=%v", sampleRate, ForceMixFormat)
 	a := &AudioOut{SampleRate: sampleRate, Channels: channels, coInit: true}
 	if err := a.init(sampleRate, channels); err != nil {
 		a.Close()
@@ -308,17 +333,79 @@ func (a *AudioOut) init(sampleRate, channels int) error {
 	flags := uintptr(audclntStreamFlagsAutoConvertPCM | audclntStreamFlagsSRCDefaultQuality)
 	tracef("Initialize: wf=%+v sizeof=%d flags=0x%x dur=%d fmt=%p",
 		a.wf, unsafe.Sizeof(a.wf), uint64(flags), uint64(hnsBuffer), unsafe.Pointer(&a.wf))
-	r = comCall(client, 3, initArgs(flags, uint64(hnsBuffer), 0, uintptr(unsafe.Pointer(&a.wf)), 0)...)
-	if err := hresult(r); err != nil {
-		// Report the endpoint's mix format to help diagnose unsupported setups.
-		var mix unsafe.Pointer
-		if hr := comCall(client, 8, uintptr(unsafe.Pointer(&mix))); hresult(hr) == nil && mix != nil {
-			m := (*extendedFormat)(mix)
-			tracef("mixFormat: tag=%d ch=%d rate=%d bits=%d block=%d cbSize=%d",
-				m.FormatTag, m.Channels, m.SamplesPerSec, m.BitsPerSample, m.BlockAlign, m.CbSize)
-			procCoTaskMemFree.Call(uintptr(mix))
+	// Try the auto-convert path first. It must be skipped entirely when forced
+	// into the fallback: IAudioClient can only be initialized once, so a
+	// "successful attempt followed by another attempt" yields
+	// AUDCLNT_E_ALREADY_INITIALIZED.
+	var autoErr error
+	AutoAttempted := false
+	if !ForceMixFormat {
+		AutoAttempted = true
+		r = comCall(client, 3, initArgs(flags, uint64(hnsBuffer), 0, uintptr(unsafe.Pointer(&a.wf)), 0)...)
+		autoErr = hresult(r)
+	}
+	if AutoAttempted && autoErr == nil {
+		a.Autoconvert = true
+	} else {
+		// Fallback: open the stream with the endpoint's exact mix format and do
+		// the conversion ourselves. Windows 7 audio drivers are far less
+		// forgiving about AUTOCONVERTPCM than modern ones.
+		if autoErr != nil {
+			tracef("autoconvert rejected (%v), trying exact mix format", autoErr)
 		}
-		return fmt.Errorf("IAudioClient.Initialize: %w", err)
+		var mix unsafe.Pointer
+		if hr := comCall(client, 8, uintptr(unsafe.Pointer(&mix))); hresult(hr) != nil || mix == nil {
+			return fmt.Errorf("IAudioClient.Initialize: %w", autoErr)
+		}
+		m := (*extendedFormat)(mix)
+		dev := DevFormat{
+			Rate:       int(m.SamplesPerSec),
+			Channels:   int(m.Channels),
+			Bits:       int(m.BitsPerSample),
+			BlockAlign: int(m.BlockAlign),
+		}
+		// WAVE_FORMAT_EXTENSIBLE carries the real format in the SubFormat GUID's
+		// first two bytes; 3 == IEEE float.
+		if m.FormatTag == 0xFFFE {
+			dev.IsFloat = m.SubFormat[0] == 3 && m.SubFormat[1] == 0
+			if m.ValidBits != 0 {
+				dev.Bits = int(m.ValidBits)
+			}
+		} else if m.FormatTag == waveFormatIEEE {
+			dev.IsFloat = true
+		}
+		canConvert := dev.Channels == 2 && !dev.IsFloat && dev.Bits == 16
+		canConvert = canConvert || (dev.IsFloat && (dev.Bits == 32 || dev.Bits == 64))
+		canConvert = canConvert || (!dev.IsFloat && (dev.Bits == 24 || dev.Bits == 32))
+		if !canConvert {
+			procCoTaskMemFree.Call(uintptr(mix))
+			if autoErr != nil {
+				return fmt.Errorf("IAudioClient.Initialize: %w", autoErr)
+			}
+			return fmt.Errorf("IAudioClient.Initialize: unsupported mix format (%d bit, %d ch)", dev.Bits, dev.Channels)
+		}
+		tracef("fallback init with mix format %d Hz %d bit", dev.Rate, dev.Bits)
+		r = comCall(client, 3, initArgs(0, uint64(hnsBuffer), 0, uintptr(mix), 0)...)
+		initErr := hresult(r)
+		if initErr != nil {
+			procCoTaskMemFree.Call(uintptr(mix))
+			return fmt.Errorf("IAudioClient.Initialize(%d Hz/%d bit): %w", dev.Rate, dev.Bits, initErr)
+		}
+		// Copy the format so the pointer can be freed; the value is only needed
+		// for bookkeeping from here on.
+		a.wf = waveFormatEx{
+			FormatTag:      m.FormatTag,
+			Channels:       uint16(dev.Channels),
+			SamplesPerSec:  uint32(dev.Rate),
+			BitsPerSample:  uint16(dev.Bits),
+			BlockAlign:     uint16(dev.BlockAlign),
+			AvgBytesPerSec: uint32(dev.Rate * dev.BlockAlign),
+		}
+		procCoTaskMemFree.Call(uintptr(mix))
+		a.Autoconvert = false
+		a.Dev = dev
+		a.BytesPerFrame = dev.BlockAlign
+		tracef("using mix format: rate=%d bits=%d float=%v block=%d", dev.Rate, dev.Bits, dev.IsFloat, dev.BlockAlign)
 	}
 
 	var frames uint32

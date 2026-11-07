@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 
 	"netmusic/internal/app"
+	"netmusic/internal/audio"
 	"netmusic/internal/ui"
 	"netmusic/internal/w32"
 )
@@ -21,6 +22,7 @@ func main() {
 	stage := flag.Int("stage", 5, "selftest depth: 0=idle 1=playlist 2=playing 3=lyrics 4=comments 5=comments page 2")
 	soak := flag.Int("soak", 0, "play N consecutive tracks with all windows open, logging memory each round")
 	noGCLimit := flag.Bool("no-gc-limit", false, "disable the 64 MB soft memory limit (for measurement)")
+	audioFallback := flag.Bool("force-audio-fallback", false, "do not rely on WASAPI AUTOCONVERTPCM; convert samples in software (try this if there is no sound)")
 	flag.Parse()
 
 	// One OS thread drives all of Win32; goroutines handle IO and audio.
@@ -33,6 +35,10 @@ func main() {
 	}
 	if p := runtime.NumCPU(); p > 4 {
 		runtime.GOMAXPROCS(4)
+	}
+
+	if *audioFallback {
+		audio.ForceMixFormat = true
 	}
 
 	w32.SetProcessDPIAware()

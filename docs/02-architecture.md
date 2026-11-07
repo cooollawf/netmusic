@@ -140,3 +140,22 @@ HTTP(整曲) → []byte(压缩, 1~3MB) → go-mp3 解码(按需) → IAudioRende
   （`args_386.go` / `args_amd64.go` 的 `comArg64`），`MSG` 结构按架构分别定义（`msg_386.go` / `msg_amd64.go`），
   `SetWindowLongPtr` 运行时探测 `Ptr` 版本是否存在。
 - **GUI 子系统**：链接时 `-H windowsgui`，避免双击弹出控制台窗口；代价是命令行采集 stderr 需要显式重定向。
+## 2.9 音频双路径（Windows 7 保险）
+
+```
+解码器(16bit/44.1k 立体声)
+        │
+        ├─ 路径 A：IAudioClient.Initialize(我们的格式 + AUTOCONVERTPCM|SRC_DEFAULT_QUALITY)
+        │         引擎内部重采样到设备混音格式。CPU 最省，Win7+ 支持。
+        │
+        └─ 路径 B（A 被拒绝时）：GetMixFormat() → Initialize(设备格式, flags=0)
+                 软件把 16bit 转成 16/24/32-bit 整数或 32/64-bit 浮点，
+                 采样率不同就用带小数累加器的线性插值（converter）。
+```
+
+- 两条路径都在 `player.go` 的同一个循环里，差别只在"往设备缓冲写什么"。
+- 路径 B 的实现集中在 `internal/audio/convert.go`（约 130 行），首次填充时按需扩容小缓冲
+  （约 20KB），之后稳态零分配。
+- 路径 B 平时用不到，所以提供 `-force-audio-fallback`（以及 nmprobe 的 `NETMUSIC_FORCE_FALLBACK=1`）
+  强制走过并验证 —— 未经测试的兜底代码等于没有。
+- 音量在两条路径上都是就地缩放 int16（`(v/100)²` 曲线），转换发生在缩放之后。

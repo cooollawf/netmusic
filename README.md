@@ -186,10 +186,23 @@ go build -trimpath -ldflags "-s -w -H windowsgui" -o netmusic.exe .\cmd\netmusic
 netmusic32.exe -selftest -stage 5   # 免登录播放免版权歌曲，逐阶段记录内存
 netmusic32.exe -soak 10             # 连续切歌 10 次，每轮记录内存与 GDI 句柄
 netmusic32.exe -no-gc-limit         # 关掉 64MB 软堆上限（用于对比）
+netmusic32.exe -force-audio-fallback # 不用 WASAPI 自动重采样，改成软件转换（没声音时试这个）
 ```
 
 > 注意：exe 是 GUI 子系统，从命令行跑时输出需要显式重定向，例如
 > `Start-Process .\netmusic32.exe -ArgumentList '-selftest','-stage','5' -RedirectStandardError log.txt`
+
+### 没声音怎么办
+
+程序默认让 WASAPI 引擎做重采样（`AUTOCONVERTPCM`）—— 这是最省 CPU 的路径。**Windows 7 上部分老声卡驱动会拒绝它**，
+此时程序会自动回退到"用设备自己的混音格式 + 软件转换"（支持 16/24/32-bit 整数与 32/64-bit 浮点、任意采样率）。
+如果两条路都不行，或者你想强制走软件转换，加参数：
+
+```powershell
+netmusic32.exe -force-audio-fallback
+```
+
+这条兜底路径已在本机用 `-force-audio-fallback` 实测过（44.1kHz/16bit → 48kHz/float32，播放进度正常推进）。
 
 ### 代理（可选）
 
@@ -234,6 +247,9 @@ netmusic32.exe -no-gc-limit         # 关掉 64MB 软堆上限（用于对比）
 5. **双击弹黑框**：加 `-H windowsgui`。
 6. **没有 manifest 时** `EM_SETCUEBANNER`（输入框占位提示）不生效。加 `app.manifest` 启用 comctl32 v6。
 7. **登录 8821 / 502「请切换登录方式或升级版本」**：见下一节。
+8. **Win7 老声卡可能拒绝 `AUTOCONVERTPCM`**：加了"用设备混音格式 + 软件转换"的兜底（16/24/32-bit 整数、
+   32/64-bit 浮点、任意采样率），并用 `-force-audio-fallback` 强制走过、实测播放正常。
+   否则在 Win7 上很可能就是静音，而且没有任何报错。
 
 ## 八、登录问题排查（8821 与 502）
 

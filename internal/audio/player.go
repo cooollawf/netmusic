@@ -125,7 +125,9 @@ func (p *Player) loop() {
 		dec     *mp3.Decoder
 		src     *bytes.Reader
 		payload []byte
-		rate    int
+		rate    int      // decoder sample rate
+		outRate int      // rate the device consumes at (== rate on the fast path)
+		conv    *converter
 		base    int64 // absolute sample frame where decoding resumed
 		written int64 // frames written since the last reset
 		eof     bool
@@ -140,15 +142,22 @@ func (p *Player) loop() {
 	}
 
 	openFor := func(sampleRate int) error {
-		if out != nil && out.SampleRate == sampleRate {
+		if out != nil && out.SampleRate == sampleRate && (conv == nil) == out.Autoconvert {
 			return nil
 		}
 		cleanup()
+		conv = nil
 		o, err := OpenStream(sampleRate, 2)
 		if err != nil {
 			return err
 		}
 		out = o
+		outRate = sampleRate
+		if !o.Autoconvert {
+			// The engine would not convert for us; do it in software.
+			conv = newConverter(o.Dev, sampleRate)
+			outRate = o.Dev.Rate
+		}
 		return nil
 	}
 
@@ -156,6 +165,9 @@ func (p *Player) loop() {
 		if out != nil {
 			out.Stop()
 			out.Reset()
+		}
+		if conv != nil {
+			conv.reset()
 		}
 		written = 0
 		eof = false
@@ -257,7 +269,9 @@ func (p *Player) loop() {
 					written = 0
 					eof = false
 					ending = false
-					p.posMs.Store(base * 1000 / int64(rate))
+					if outRate > 0 {
+						p.posMs.Store(base * 1000 / int64(outRate))
+					}
 					if wasPlaying {
 						out.Start()
 					}
@@ -292,26 +306,39 @@ func (p *Player) loop() {
 			continue
 		}
 		buf := Slice(ptr, avail*out.BytesPerFrame)
-		n, rerr := io.ReadFull(dec, buf)
-		if n < len(buf) {
-			// silence pad at end of stream
-			for i := n; i < len(buf); i++ {
-				buf[i] = 0
+		var rerr error
+		if conv != nil {
+			// Endpoint mix format we could not let the engine convert: decode
+			// 16-bit stereo and convert/resample ourselves.
+			var done bool
+			done, rerr = conv.fill(dec, avail, buf, int(p.vol.Load()))
+			if done {
+				eof = true
 			}
-			eof = true
+		} else {
+			var n int
+			n, rerr = io.ReadFull(dec, buf)
+			if n < len(buf) {
+				// silence pad at end of stream
+				for i := n; i < len(buf); i++ {
+					buf[i] = 0
+				}
+				eof = true
+			}
+			applyGain(buf[:n], int(p.vol.Load()))
 		}
-		applyGain(buf[:n], int(p.vol.Load()))
 		out.Release(avail)
 		written += int64(avail)
 
-		// Position = decoded frames minus what is still queued.
+		// Position = decoded frames minus what is still queued. `rate` is the
+		// decode rate, outRate the rate the device is consuming at.
 		inflight := out.Padding()
 		frames := base + written - int64(inflight)
 		if frames < 0 {
 			frames = 0
 		}
-		if rate > 0 {
-			p.posMs.Store(frames * 1000 / int64(rate))
+		if outRate > 0 {
+			p.posMs.Store(frames * 1000 / int64(outRate))
 		}
 
 		if (eof || rerr != nil) && !ending {

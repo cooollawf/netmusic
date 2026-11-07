@@ -1,0 +1,8 @@
+audio: Win7 WASAPI fallback path (mix format + software conversion)
+
+- when AUTOCONVERTPCM is rejected, open the stream with the exact GetMixFormat
+- convert 16/24/32-bit int and 32/64-bit float, linear-interp resampling with fractional carry
+- fix Initialize being called twice (AUDCLNT_E_ALREADY_INITIALIZED)
+- add -force-audio-fallback / NETMUSIC_FORCE_FALLBACK so the fallback can be tested
+- verified on both archs: 44.1k/16bit -> 48k/float32 plays with correct position
+- docs: dual audio path + troubleshooting for no sound

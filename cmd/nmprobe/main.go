@@ -36,6 +36,13 @@ func main() {
 		usage()
 		os.Exit(1)
 	}
+	// Lets the manual mix-format conversion path be exercised on machines where
+	// AUTOCONVERTPCM works, which is the only way to test that Windows 7
+	// safety net before shipping.
+	if os.Getenv("NETMUSIC_FORCE_FALLBACK") != "" {
+		audio.ForceMixFormat = true
+		audio.DebugTrace = true
+	}
 	cl := netease.NewClient(netx.NewHTTPClient(netx.ProxyMode("")))
 	switch os.Args[1] {
 	case "search":
