@@ -6,3 +6,4 @@ nmprobe64.exe
 .shots/
 .tools/
 *.tmp
+.commitmsg
