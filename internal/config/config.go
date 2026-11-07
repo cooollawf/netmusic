@@ -81,13 +81,15 @@ func Load() *Config {
 
 	var legacyCookies map[string]string
 	if b, err := os.ReadFile(c.path); err == nil {
-		var raw struct {
-			Config
-			LegacyCookies map[string]string `json:"cookies"`
+		// Two decodes of one small file: the first fills c in place (copying a
+		// struct that owns a mutex is a vet error and a real footgun), the
+		// second only picks up the legacy plaintext cookie block.
+		_ = json.Unmarshal(b, &c)
+		var legacy struct {
+			Cookies map[string]string `json:"cookies"`
 		}
-		if json.Unmarshal(b, &raw) == nil {
-			c = raw.Config
-			legacyCookies = raw.LegacyCookies
+		if json.Unmarshal(b, &legacy) == nil {
+			legacyCookies = legacy.Cookies
 		}
 	}
 	if c.Cookies == nil {
