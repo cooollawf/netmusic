@@ -4,12 +4,14 @@ import (
 	"netmusic/internal/w32"
 )
 
-// LoginWindow offers both login paths NetEase supports for desktop clients:
-// scan a QR code with the phone app, or type the phone number + password.
+// LoginWindow offers the three ways NetEase allows a desktop client to sign in:
+// scan a QR code, type the phone number + password, or phone + SMS code (the
+// supported way past risk control when the password path returns 8821).
 type LoginWindow struct {
 	*Panel
 
 	tab     int // 0 = 扫码, 1 = 手机号
+	mode    int // 0 = 密码, 1 = 短信验证码
 	qr      *w32.DIB
 	qrState string
 	status  string
@@ -17,15 +19,20 @@ type LoginWindow struct {
 
 	phoneEdit uintptr
 	pwEdit    uintptr
+	codeEdit  uintptr
 
 	btnTabQR    w32.RECT
 	btnTabPhone w32.RECT
+	btnMode     w32.RECT
+	btnSendCode w32.RECT
 	btnRefresh  w32.RECT
 	btnLogin    w32.RECT
 	hoverBtn    int
 
-	OnRequestQR  func()               // ask for a fresh key + QR image
-	OnPhoneLogin func(phone, pw string) // submit credentials
+	OnRequestQR    func()                   // ask for a fresh key + QR image
+	OnPhoneLogin   func(phone, pw string)   // password path
+	OnSendCaptcha  func(phone string)       // request an SMS code
+	OnCaptchaLogin func(phone, code string) // SMS code path
 }
 
 func NewLoginWindow() *LoginWindow {
@@ -33,45 +40,89 @@ func NewLoginWindow() *LoginWindow {
 	lw.Panel = NewPanel("登录", dp(340), dp(430))
 	lw.Panel.Body = lw.body
 	lw.Panel.OnMsg = lw.onMsg
-	lw.Panel.OnClose = func() {}
 	return lw
 }
 
+func (lw *LoginWindow) formX() (int32, int32) {
+	ex := lw.W/2 - dp(100)
+	return ex, dp(200)
+}
+
 func (lw *LoginWindow) layout() {
-	lw.btnTabQR = rc(dp(10), dp(31), dp(10) + dp(70), dp(31) + dp(22))
-	lw.btnTabPhone = rc(dp(84), dp(31), dp(84) + dp(70), dp(31) + dp(22))
-	lw.btnRefresh = rc(lw.W/2 - dp(40), dp(360), lw.W/2 + dp(40), dp(360) + dp(22))
-	lw.btnLogin = rc(lw.W/2 - dp(50), dp(330), lw.W/2 + dp(50), dp(330) + dp(24))
+	lw.btnTabQR = rc(dp(10), dp(31), dp(10)+dp(70), dp(31)+dp(22))
+	lw.btnTabPhone = rc(dp(84), dp(31), dp(84)+dp(70), dp(31)+dp(22))
+	lw.btnMode = rc(dp(14), dp(196), dp(14)+dp(116), dp(196)+dp(22))
+	lw.btnSendCode = rc(lw.W-dp(14)-dp(96), dp(196), lw.W-dp(14), dp(196)+dp(22))
+	lw.btnRefresh = rc(lw.W/2-dp(46), dp(360), lw.W/2+dp(46), dp(360)+dp(22))
+	lw.btnLogin = rc(lw.W/2-dp(60), dp(248), lw.W/2+dp(60), dp(248)+dp(26))
 
 	if lw.editReady() {
-		ex := lw.W/2 - dp(100)
-		w32.MoveWindow(lw.phoneEdit, ex, dp(120), dp(200), dp(22), true)
-		w32.MoveWindow(lw.pwEdit, ex, dp(156), dp(200), dp(22), true)
+		ex, ew := lw.formX()
+		w32.MoveWindow(lw.phoneEdit, ex, dp(120), ew, dp(22), true)
+		w32.MoveWindow(lw.pwEdit, ex, dp(158), ew, dp(22), true)
+		w32.MoveWindow(lw.codeEdit, ex, dp(158), ew, dp(22), true)
+		lw.syncEditVisibility()
 	}
 }
 
-func (lw *LoginWindow) editReady() bool { return lw.phoneEdit != 0 && lw.pwEdit != 0 }
+// syncEditVisibility keeps the native EDIT children in sync with the current
+// tab/mode. Native child windows always paint over the parent, so an edit left
+// visible on the QR tab shows up as a dark bar across the code - a regression
+// worth a dedicated function.
+func (lw *LoginWindow) syncEditVisibility() {
+	show := func(h uintptr, visible bool) {
+		if h == 0 {
+			return
+		}
+		cmd := uintptr(w32.SW_HIDE)
+		if visible {
+			cmd = w32.SW_SHOW
+		}
+		w32.ShowWindow(h, cmd)
+	}
+	phoneTab := lw.tab == 1
+	show(lw.phoneEdit, phoneTab)
+	show(lw.pwEdit, phoneTab && lw.mode == 0)
+	show(lw.codeEdit, phoneTab && lw.mode == 1)
+}
+
+func (lw *LoginWindow) editReady() bool {
+	return lw.phoneEdit != 0 && lw.pwEdit != 0 && lw.codeEdit != 0
+}
 
 func (lw *LoginWindow) ensureEdits() {
 	if lw.editReady() {
 		return
 	}
-	ex := lw.W/2 - dp(100)
-	lw.phoneEdit = NewEdit(lw.HWnd, 201, ex, dp(120), dp(200), dp(22), "手机号")
-	lw.pwEdit = NewPasswordEdit(lw.HWnd, 202, ex, dp(156), dp(200), dp(22), "密码")
-	if lw.phoneEdit != 0 {
-		SetEditEnter(lw.phoneEdit, lw.submitPhone)
-	}
+	ex, ew := lw.formX()
+	lw.phoneEdit = NewEdit(lw.HWnd, 201, ex, dp(120), ew, dp(22), "手机号")
+	lw.pwEdit = NewPasswordEdit(lw.HWnd, 202, ex, dp(158), ew, dp(22), "密码")
+	lw.codeEdit = NewEdit(lw.HWnd, 203, ex, dp(158), ew, dp(22), "短信验证码")
 	if lw.pwEdit != 0 {
-		SetEditEnter(lw.pwEdit, lw.submitPhone)
+		SetEditEnter(lw.pwEdit, lw.submit)
+	}
+	if lw.codeEdit != 0 {
+		SetEditEnter(lw.codeEdit, lw.submit)
+	}
+	if lw.phoneEdit != 0 {
+		SetEditEnter(lw.phoneEdit, lw.submit)
 	}
 }
 
-func (lw *LoginWindow) submitPhone() {
-	if lw.OnPhoneLogin == nil || !lw.editReady() {
+func (lw *LoginWindow) submit() {
+	if !lw.editReady() {
 		return
 	}
-	lw.OnPhoneLogin(EditText(lw.phoneEdit), EditText(lw.pwEdit))
+	phone := EditText(lw.phoneEdit)
+	if lw.mode == 0 {
+		if lw.OnPhoneLogin != nil {
+			lw.OnPhoneLogin(phone, EditText(lw.pwEdit))
+		}
+		return
+	}
+	if lw.OnCaptchaLogin != nil {
+		lw.OnCaptchaLogin(phone, EditText(lw.codeEdit))
+	}
 }
 
 // SetQR installs a freshly rendered QR bitmap (ownership transfers).
@@ -99,30 +150,37 @@ func (lw *LoginWindow) Reset() {
 	lw.qrState = "正在获取二维码…"
 	lw.status = ""
 	lw.tab = 0
+	lw.mode = 0
 	lw.Panel.Invalidate()
 }
 
 func (lw *LoginWindow) ShowQR() {
 	lw.tab = 0
 	lw.ensureEdits()
-	lw.hideEdits(true)
+	lw.layout()
 	lw.Panel.Show()
 }
 
-func (lw *LoginWindow) hideEdits(hide bool) {
-	if !lw.editReady() {
-		return
+// UseCaptchaMode switches the phone form to the SMS code flow, used when the
+// password path hits risk control (code 8821).
+func (lw *LoginWindow) UseCaptchaMode(hint string) {
+	lw.ensureEdits()
+	lw.tab = 1
+	lw.mode = 1
+	if hint != "" {
+		lw.status = hint
 	}
-	cmd := uintptr(w32.SW_SHOW)
-	if hide {
-		cmd = w32.SW_HIDE
-	}
-	// SW_HIDE for QR tab
-	if lw.tab == 0 {
-		cmd = w32.SW_HIDE
-	}
-	w32.ShowWindow(lw.phoneEdit, cmd)
-	w32.ShowWindow(lw.pwEdit, cmd)
+	lw.layout()
+	w32.Invalidate(lw.HWnd)
+}
+
+// ShowPhoneMode opens the password form (used when the QR flow is blocked).
+func (lw *LoginWindow) ShowPhoneMode() {
+	lw.ensureEdits()
+	lw.tab = 1
+	lw.layout()
+	w32.SetFocus(lw.phoneEdit)
+	w32.Invalidate(lw.HWnd)
 }
 
 func (lw *LoginWindow) body(dc w32.HDC, client w32.RECT) {
@@ -131,11 +189,10 @@ func (lw *LoginWindow) body(dc w32.HDC, client w32.RECT) {
 	drawChip(dc, lw.btnTabPhone, "手机号登录", lw.hoverBtn == 2, lw.tab == 1)
 
 	if lw.tab == 0 {
-		// QR frame
 		side := dp(210)
 		x := (lw.W - side) / 2
 		y := dp(64)
-		r := rc(x, y, x + side, y + side)
+		r := rc(x, y, x+side, y+side)
 		fill(dc, r, w32.RGB(0xFF, 0xFF, 0xFF))
 		if lw.qr != nil {
 			lw.qr.Blit(dc, r.Left, r.Top)
@@ -145,17 +202,27 @@ func (lw *LoginWindow) body(dc w32.HDC, client w32.RECT) {
 		if st == "" {
 			st = "请使用网易云音乐 App 扫码"
 		}
-		drawTextIn(dc, rc(dp(10), y + side + dp(8), lw.W - dp(10), y + side + dp(28)), st,
+		drawTextIn(dc, rc(dp(10), y+side+dp(8), lw.W-dp(10), y+side+dp(28)), st,
 			textOpt{Font: T.FontS, Color: T.TextMid, Align: w32.DT_CENTER})
 		drawChip(dc, lw.btnRefresh, "刷新二维码", lw.hoverBtn == 3, false)
 	} else {
-		drawTextIn(dc, rc(dp(10), dp(96), lw.W - dp(10), dp(118)), "手机号", textOpt{Font: T.FontXS, Color: T.TextDim})
-		drawTextIn(dc, rc(dp(10), dp(136), lw.W - dp(10), dp(156)), "密码", textOpt{Font: T.FontXS, Color: T.TextDim})
-		drawChip(dc, lw.btnLogin, "登录", lw.hoverBtn == 4, false)
+		drawTextIn(dc, rc(dp(14), dp(96), lw.W-dp(14), dp(118)), "手机号",
+			textOpt{Font: T.FontXS, Color: T.TextDim})
+		if lw.mode == 0 {
+			drawTextIn(dc, rc(dp(14), dp(134), lw.W-dp(14), dp(156)), "密码",
+				textOpt{Font: T.FontXS, Color: T.TextDim})
+			drawChip(dc, lw.btnMode, "改用验证码登录", lw.hoverBtn == 4, false)
+		} else {
+			drawTextIn(dc, rc(dp(14), dp(134), lw.W-dp(14), dp(156)), "短信验证码",
+				textOpt{Font: T.FontXS, Color: T.TextDim})
+			drawChip(dc, lw.btnMode, "改用密码登录", lw.hoverBtn == 4, false)
+			drawChip(dc, lw.btnSendCode, "获取验证码", lw.hoverBtn == 5, false)
+		}
+		drawChip(dc, lw.btnLogin, "登录", lw.hoverBtn == 6, true)
 	}
 
 	if lw.status != "" {
-		drawTextIn(dc, rc(dp(10), lw.H - dp(34), lw.W - dp(10), lw.H - dp(12)), lw.status,
+		drawTextIn(dc, rc(dp(10), lw.H-dp(40), lw.W-dp(10), lw.H-dp(14)), lw.status,
 			textOpt{Font: T.FontXS, Color: T.AccentDark, Align: w32.DT_CENTER})
 	}
 }
@@ -168,8 +235,12 @@ func (lw *LoginWindow) hitBtn(x, y int32) int {
 		return 2
 	case lw.tab == 0 && inRect(lw.btnRefresh, x, y):
 		return 3
-	case lw.tab == 1 && inRect(lw.btnLogin, x, y):
+	case lw.tab == 1 && inRect(lw.btnMode, x, y):
 		return 4
+	case lw.tab == 1 && lw.mode == 1 && inRect(lw.btnSendCode, x, y):
+		return 5
+	case lw.tab == 1 && inRect(lw.btnLogin, x, y):
+		return 6
 	}
 	return 0
 }
@@ -197,7 +268,7 @@ func (lw *LoginWindow) onMsg(msg uint32, wp, lp uintptr) (bool, uintptr) {
 		switch lw.hitBtn(x, y) {
 		case 1:
 			lw.tab = 0
-			lw.hideEdits(true)
+			lw.layout()
 			if lw.qr == nil && lw.OnRequestQR != nil {
 				lw.qrState = "正在获取二维码…"
 				lw.OnRequestQR()
@@ -205,7 +276,7 @@ func (lw *LoginWindow) onMsg(msg uint32, wp, lp uintptr) (bool, uintptr) {
 		case 2:
 			lw.tab = 1
 			lw.ensureEdits()
-			lw.hideEdits(false)
+			lw.layout()
 			w32.SetFocus(lw.phoneEdit)
 		case 3:
 			if lw.OnRequestQR != nil {
@@ -213,7 +284,20 @@ func (lw *LoginWindow) onMsg(msg uint32, wp, lp uintptr) (bool, uintptr) {
 				lw.OnRequestQR()
 			}
 		case 4:
-			lw.submitPhone()
+			lw.mode = 1 - lw.mode
+			lw.status = ""
+			lw.layout()
+			if lw.mode == 1 {
+				w32.SetFocus(lw.codeEdit)
+			} else {
+				w32.SetFocus(lw.pwEdit)
+			}
+		case 5:
+			if lw.OnSendCaptcha != nil && lw.editReady() {
+				lw.OnSendCaptcha(EditText(lw.phoneEdit))
+			}
+		case 6:
+			lw.submit()
 		}
 		w32.Invalidate(lw.HWnd)
 		return true, 0

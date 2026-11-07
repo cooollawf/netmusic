@@ -1,6 +1,8 @@
 netmusic.exe
-nmprobe.exe
 netmusic32.exe
+nmprobe.exe
+nmprobe32.exe
+nmprobe64.exe
 .shots/
 .tools/
 *.tmp

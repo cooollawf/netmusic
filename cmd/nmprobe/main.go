@@ -5,8 +5,14 @@ package main
 
 import (
 	"bytes"
+	"crypto/md5"
 	"crypto/tls"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"net"
 	"net/http"
@@ -17,10 +23,12 @@ import (
 	"time"
 
 	"github.com/hajimehoshi/go-mp3"
+	qrcode "github.com/skip2/go-qrcode"
 
 	"netmusic/internal/audio"
 	"netmusic/internal/netease"
 	"netmusic/internal/netx"
+	"netmusic/internal/w32"
 )
 
 func main() {
@@ -54,9 +62,173 @@ func main() {
 		probeRaw(os.Args[2], os.Args[3:]...)
 	case "audio":
 		probeAudio(cl, os.Args[2])
+	case "login":
+		probeLogin(cl, os.Args[2], os.Args[3])
+	case "wasapi":
+		probeWASAPI()
+	case "dibtest":
+		probeDIB(os.Args[2])
+	case "qrtest":
+		probeQRImage(os.Args[2])
 	default:
 		usage()
 	}
+}
+
+// probeWASAPI opens the audio device with full tracing, to compare behaviour
+// between the 32-bit and 64-bit builds.
+func probeWASAPI() {
+	audio.DebugTrace = true
+	for _, line := range audio.Diagnose() {
+		fmt.Println(" ", line)
+	}
+	out, err := audio.OpenStream(44100, 2)
+	if err != nil {
+		fmt.Println("OpenStream failed:", err)
+		return
+	}
+	fmt.Printf("opened: rate=%d ch=%d bufferFrames=%d bytesPerFrame=%d\n",
+		out.SampleRate, out.Channels, out.BufferFrames, out.BytesPerFrame)
+	out.Close()
+	fmt.Println("closed cleanly")
+}
+
+// probeQR reproduces the login QR pipeline exactly (go-qrcode -> png -> DIB)
+// and writes a BMP, so both architectures can be compared byte for byte.
+func probeQRImage(path string) {
+	pngBytes, err := qrcode.Encode("https://music.163.com/login?codekey=test-key-123456", qrcode.Medium, 210)
+	if err != nil {
+		fmt.Println("encode:", err)
+		return
+	}
+	img, err := png.Decode(bytes.NewReader(pngBytes))
+	if err != nil {
+		fmt.Println("png decode:", err)
+		return
+	}
+	fmt.Printf("png decoded type=%T bounds=%v\n", img, img.Bounds())
+	dib := w32.ImageToDIB(img, 210, 210)
+	if dib == nil {
+		fmt.Println("ImageToDIB nil")
+		return
+	}
+	defer dib.Free()
+	px := dib.PixelPtr()
+	sum := md5.Sum(px)
+	fmt.Printf("dib stride=%d len=%d md5=%x\n", dib.Stride, len(px), sum)
+	writeBMP(path, px, 210, 210)
+}
+
+// probeDIB renders a deterministic pattern through the image -> DIB path and
+// writes a BMP, so the 32-bit and 64-bit conversions can be compared byte for
+// byte.
+func probeDIB(path string) {
+	const w, h = 210, 210
+	src := image.NewRGBA(image.Rect(0, 0, 64, 64))
+	for y := 0; y < 64; y++ {
+		for x := 0; x < 64; x++ {
+			var c color.RGBA
+			switch {
+			case (x/8+y/8)%2 == 0:
+				c = color.RGBA{R: 255, A: 255}
+			default:
+				c = color.RGBA{G: uint8(x * 4), B: uint8(y * 4), A: 255}
+			}
+			src.SetRGBA(x, y, c)
+		}
+	}
+	w32.SetProcessDPIAware()
+	dib := w32.ImageToDIB(src, w, h)
+	if dib == nil {
+		fmt.Println("ImageToDIB returned nil")
+		return
+	}
+	defer dib.Free()
+	px := dib.PixelPtr()
+	fmt.Printf("dib %dx%d stride=%d len(px)=%d expect=%d\n", dib.W, dib.H, dib.Stride, len(px), dib.Stride*dib.H)
+	writeBMP(path, px, w, h)
+	sum := md5.Sum(px)
+	fmt.Printf("wrote %s md5=%x\n", path, sum)
+}
+
+// writeBMP dumps a top-down 32bpp BGRA buffer as a BMP file.
+func writeBMP(path string, px []byte, w, h int) {
+	hdr := make([]byte, 54)
+	hdr[0], hdr[1] = 'B', 'M'
+	binary.LittleEndian.PutUint32(hdr[2:], uint32(54+len(px)))
+	binary.LittleEndian.PutUint32(hdr[10:], 54)
+	binary.LittleEndian.PutUint32(hdr[14:], 40)
+	binary.LittleEndian.PutUint32(hdr[18:], uint32(w))
+	binary.LittleEndian.PutUint32(hdr[22:], ^uint32(h)+1) // negative height: top-down
+	binary.LittleEndian.PutUint16(hdr[26:], 1)
+	binary.LittleEndian.PutUint16(hdr[28:], 32)
+	binary.LittleEndian.PutUint32(hdr[34:], uint32(len(px)))
+	if err := os.WriteFile(path, append(hdr, px...), 0o644); err != nil {
+		fmt.Println("write:", err)
+	}
+}
+
+// probeLogin diagnoses phone login without touching the GUI. Running it with a
+// throwaway number separates "our request is wrong" from "the account needs
+// risk-control verification":
+//   501 / 502 -> encryption and request shape are fine, only credentials differ
+//   8821      -> server risk control (needs an SMS captcha), account agnostic
+//   400/ENC   -> the request itself is malformed
+func probeLogin(cl *netease.Client, phone, password string) {
+	sum := md5.Sum([]byte(password))
+	md5pw := hex.EncodeToString(sum[:])
+
+	fmt.Println("--- 0: 生产代码路径 LoginCellphone（预热 + csrf + 设备指纹）---")
+	prof, err := cl.LoginCellphone(phone, password, "86")
+	if le, ok := err.(*netease.LoginError); ok {
+		fmt.Printf("  err=%v  code=%d\n", le, le.Code)
+	} else {
+		fmt.Printf("  err=%v  profile=%+v\n", err, prof)
+	}
+
+	base := map[string]any{
+		"phone":         phone,
+		"countrycode":   "86",
+		"password":      md5pw,
+		"rememberLogin": "true",
+		"type":          "1",
+		"https":         "true",
+		"remember":      "true",
+	}
+
+	fmt.Println("--- A: 当前实现（带空的 csrf_token）---")
+	dataA := map[string]any{}
+	for k, v := range base {
+		dataA[k] = v
+	}
+	dataA["csrf_token"] = ""
+	dump(cl, "/weapi/login/cellphone", dataA)
+
+	fmt.Println("--- B: 不带 csrf_token ---")
+	dump(cl, "/weapi/login/cellphone", base)
+
+	fmt.Println("--- C: 带明文密码形式的 captcha 占位（不带 password）---")
+	dataC := map[string]any{
+		"phone":       phone,
+		"countrycode": "86",
+		"captcha":     "0000",
+		"rememberLogin": "true",
+	}
+	dump(cl, "/weapi/login/cellphone", dataC)
+
+	fmt.Println("--- D: 明文 /api/login/cellphone（预期 ENC 拒绝）---")
+	code, body, _, err := cl.DebugPost("/api/login/cellphone", url.Values{
+		"phone": {phone}, "password": {md5pw}, "countrycode": {"86"}, "rememberLogin": {"true"},
+	})
+	fmt.Printf("HTTP %d err=%v body=%s\n", code, err, clip(string(body), 200))
+
+	fmt.Println("--- E: 短信验证码发送接口（本机不真正获取验证码）---")
+	dump(cl, "/weapi/sms/captcha/sent", map[string]any{"cellphone": phone, "ctcode": "86"})
+}
+
+func dump(cl *netease.Client, path string, data map[string]any) {
+	code, body, cks, err := cl.DebugWeapi(path, data)
+	fmt.Printf("HTTP %d err=%v cookies=%d\n  %s\n", code, err, len(cks), clip(string(body), 320))
 }
 
 // probeAudio drives the real WASAPI path for a few seconds so the audio stack

@@ -5,6 +5,7 @@ package audio
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"syscall"
 	"unsafe"
@@ -18,6 +19,7 @@ var (
 	procCoCreateInstance = ole32.NewProc("CoCreateInstance")
 	procCoUninitialize   = ole32.NewProc("CoUninitialize")
 	procSleep            = kernel32.NewProc("Sleep")
+	procCoTaskMemFree    = ole32.NewProc("CoTaskMemFree")
 )
 
 const (
@@ -58,6 +60,19 @@ var (
 	iidIAudioRenderClient  = makeGUID(0xF294ACFC, 0x3146, 0x4483, []byte{0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2})
 )
 
+type extendedFormat struct {
+	FormatTag      uint16
+	Channels       uint16
+	SamplesPerSec  uint32
+	AvgBytesPerSec uint32
+	BlockAlign     uint16
+	BitsPerSample  uint16
+	CbSize         uint16
+	ValidBits      uint16
+	ChannelMask    uint32
+	SubFormat      [16]byte
+}
+
 type waveFormatEx struct {
 	FormatTag      uint16
 	Channels       uint16
@@ -69,13 +84,30 @@ type waveFormatEx struct {
 }
 
 // comCall invokes vtable method idx on obj.
+//
+// It must NOT allocate: callers take &localStruct and pass it as a uintptr, and
+// any allocation between that conversion and the syscall can grow the goroutine
+// stack and invalidate the pointer's address. The 32-bit build hit exactly this
+// — IAudioClient::Initialize returned E_INVALIDARG because the slice allocation
+// below moved the WAVEFORMATEX out from under the pointer. A fixed-size array
+// keeps the call allocation free.
 func comCall(obj unsafe.Pointer, idx int, args ...uintptr) uintptr {
 	vtbl := *(*unsafe.Pointer)(obj)
 	fn := *(*uintptr)(unsafe.Add(vtbl, uintptr(idx)*unsafe.Sizeof(uintptr(0))))
-	full := make([]uintptr, 0, len(args)+1)
-	full = append(full, uintptr(obj))
-	full = append(full, args...)
-	r, _, _ := syscall.SyscallN(fn, full...)
+	var buf [16]uintptr
+	n := len(args) + 1
+	if n > len(buf) {
+		// Nothing in this package passes that many arguments; guard anyway.
+		full := make([]uintptr, 0, n)
+		full = append(full, uintptr(obj))
+		full = append(full, args...)
+		r := syscallV(fn, full)
+		return r
+	}
+	buf[0] = uintptr(obj)
+	copy(buf[1:], args)
+	r := syscallV(fn, buf[:n])
+	runtime.KeepAlive(obj)
 	return r
 }
 
@@ -104,6 +136,10 @@ type AudioOut struct {
 	Channels     int
 	BytesPerFrame int
 
+	// wf lives in the heap-owned AudioOut so its address stays valid even if
+	// the goroutine stack moves while the call is being prepared.
+	wf waveFormatEx
+
 	bufPtr unsafe.Pointer
 	started bool
 	coInit  bool
@@ -128,6 +164,104 @@ func OpenStream(sampleRate, channels int) (*AudioOut, error) {
 	return a, nil
 }
 
+// Diagnose runs an IAudioClient::Initialize argument matrix and returns a log.
+// It exists because the 32-bit build fails where the 64-bit build succeeds with
+// byte-identical arguments, and guessing is expensive.
+func Diagnose() []string {
+	var out []string
+	runtime.LockOSThread()
+	hr, _, _ := procCoInitializeEx.Call(0, coinitApartmentThreaded)
+	out = append(out, fmt.Sprintf("CoInitializeEx hr=0x%08x sizeof(uintptr)=%d", uint32(hr), unsafe.Sizeof(uintptr(0))))
+
+	var enum unsafe.Pointer
+	hr, _, _ = procCoCreateInstance.Call(
+		uintptr(unsafe.Pointer(&clsidMMDeviceEnumerator)), 0, clsctxAll,
+		uintptr(unsafe.Pointer(&iidIMMDeviceEnumerator)), uintptr(unsafe.Pointer(&enum)))
+	out = append(out, fmt.Sprintf("CoCreateInstance hr=0x%08x", uint32(hr)))
+	if int32(hr) < 0 {
+		return out
+	}
+	defer comRelease(enum)
+
+	var dev unsafe.Pointer
+	r := comCall(enum, 4, uintptr(eRender), uintptr(eConsole), uintptr(unsafe.Pointer(&dev)))
+	out = append(out, fmt.Sprintf("GetDefaultAudioEndpoint hr=0x%08x", uint32(r)))
+	if int32(r) < 0 {
+		return out
+	}
+	defer comRelease(dev)
+
+	var client unsafe.Pointer
+	r = comCall(dev, 3, uintptr(unsafe.Pointer(&iidIAudioClient)), clsctxAll, 0, uintptr(unsafe.Pointer(&client)))
+	out = append(out, fmt.Sprintf("Activate hr=0x%08x client=%p", uint32(r), client))
+	if int32(r) < 0 {
+		return out
+	}
+	defer comRelease(client)
+
+	wf := &waveFormatEx{
+		FormatTag: waveFormatPCM, Channels: 2, SamplesPerSec: 44100,
+		BitsPerSample: 16, BlockAlign: 4, AvgBytesPerSec: 176400,
+	}
+	out = append(out, fmt.Sprintf("fmt=%p %+v", unsafe.Pointer(wf), *wf))
+
+	// IsFormatSupported(shared, fmt, &closest): tells us whether the format
+	// pointer is even readable by the object.
+	var closest unsafe.Pointer
+	r = comCall(client, 7, uintptr(audclntShareModeShared), uintptr(unsafe.Pointer(wf)), uintptr(unsafe.Pointer(&closest)))
+	out = append(out, fmt.Sprintf("IsFormatSupported(shared, pcm16/44k) hr=0x%08x", uint32(r)))
+	if closest != nil {
+		m := (*extendedFormat)(closest)
+		out = append(out, fmt.Sprintf("  closest: tag=%d ch=%d rate=%d bits=%d block=%d",
+			m.FormatTag, m.Channels, m.SamplesPerSec, m.BitsPerSample, m.BlockAlign))
+		procCoTaskMemFree.Call(uintptr(closest))
+	}
+
+	tryInit := func(label string, flags uintptr, dur int64, fmtPtr *waveFormatEx) {
+		r := comCall(client, 3, initArgs(flags, uint64(dur), 0,
+			uintptr(unsafe.Pointer(fmtPtr)), 0)...)
+		out = append(out, fmt.Sprintf("Initialize[%s] flags=0x%08x dur=%d hr=0x%08x", label, uint64(flags), dur, uint32(r)))
+	}
+
+	tryInit("autocvt+srcdefault 100ms", audclntStreamFlagsAutoConvertPCM|audclntStreamFlagsSRCDefaultQuality, 1000000, wf)
+	tryInit("autocvt only", audclntStreamFlagsAutoConvertPCM, 1000000, wf)
+	tryInit("no flags", 0, 1000000, wf)
+	tryInit("autocvt 200ms", audclntStreamFlagsAutoConvertPCM|audclntStreamFlagsSRCDefaultQuality, 2000000, wf)
+
+	// Exact mix format, no conversion requested.
+	var mix unsafe.Pointer
+	if hr := comCall(client, 8, uintptr(unsafe.Pointer(&mix))); int32(hr) >= 0 && mix != nil {
+		m := (*extendedFormat)(mix)
+		out = append(out, fmt.Sprintf("mixFormat: tag=%d ch=%d rate=%d bits=%d block=%d cbSize=%d",
+			m.FormatTag, m.Channels, m.SamplesPerSec, m.BitsPerSample, m.BlockAlign, m.CbSize))
+		r := comCall(client, 3, initArgs(0, 1000000, 0, uintptr(mix), 0)...)
+		out = append(out, fmt.Sprintf("Initialize[mixfmt exact] hr=0x%08x", uint32(r)))
+		procCoTaskMemFree.Call(uintptr(mix))
+	}
+	procCoUninitialize.Call()
+	return out
+}
+
+// DebugTrace enables verbose HRESULT tracing to stderr (used by nmprobe).
+var DebugTrace bool
+
+func tracef(format string, args ...any) {
+	if DebugTrace {
+		fmt.Fprintf(os.Stderr, "[wasapi] "+format+"\n", args...)
+	}
+}
+
+// initArgs builds the IAudioClient::Initialize argument list. The two
+// REFERENCE_TIME values are 64-bit in C, so they need two stack slots each on
+// 32-bit Windows (see comArg64).
+func initArgs(flags uintptr, bufferDuration, periodicity uint64, fmt, guid uintptr) []uintptr {
+	args := make([]uintptr, 0, 12)
+	args = append(args, uintptr(audclntShareModeShared), flags)
+	args = append(args, comArg64(bufferDuration)...)
+	args = append(args, comArg64(periodicity)...)
+	args = append(args, fmt, guid)
+	return args
+}
 func (a *AudioOut) init(sampleRate, channels int) error {
 	var enum unsafe.Pointer
 	hr, _, _ := procCoCreateInstance.Call(
@@ -140,6 +274,7 @@ func (a *AudioOut) init(sampleRate, channels int) error {
 		return fmt.Errorf("CoCreateInstance: %w", err)
 	}
 	a.enum = enum
+	tracef("CoCreateInstance ok enum=%p", enum)
 
 	// IMMDeviceEnumerator::GetDefaultAudioEndpoint (vtable 4)
 	var dev unsafe.Pointer
@@ -157,7 +292,7 @@ func (a *AudioOut) init(sampleRate, channels int) error {
 	}
 	a.client = client
 
-	wf := waveFormatEx{
+	a.wf = waveFormatEx{
 		FormatTag:      waveFormatPCM,
 		Channels:       uint16(channels),
 		SamplesPerSec:  uint32(sampleRate),
@@ -171,15 +306,18 @@ func (a *AudioOut) init(sampleRate, channels int) error {
 	// engine convert from our format to the endpoint format.
 	const hnsBuffer = int64(1000000) // 100 ms in 100 ns units
 	flags := uintptr(audclntStreamFlagsAutoConvertPCM | audclntStreamFlagsSRCDefaultQuality)
-	r = comCall(client, 3,
-		uintptr(audclntShareModeShared),
-		flags,
-		uintptr(hnsBuffer),
-		0,
-		uintptr(unsafe.Pointer(&wf)),
-		0,
-	)
+	tracef("Initialize: wf=%+v sizeof=%d flags=0x%x dur=%d fmt=%p",
+		a.wf, unsafe.Sizeof(a.wf), uint64(flags), uint64(hnsBuffer), unsafe.Pointer(&a.wf))
+	r = comCall(client, 3, initArgs(flags, uint64(hnsBuffer), 0, uintptr(unsafe.Pointer(&a.wf)), 0)...)
 	if err := hresult(r); err != nil {
+		// Report the endpoint's mix format to help diagnose unsupported setups.
+		var mix unsafe.Pointer
+		if hr := comCall(client, 8, uintptr(unsafe.Pointer(&mix))); hresult(hr) == nil && mix != nil {
+			m := (*extendedFormat)(mix)
+			tracef("mixFormat: tag=%d ch=%d rate=%d bits=%d block=%d cbSize=%d",
+				m.FormatTag, m.Channels, m.SamplesPerSec, m.BitsPerSample, m.BlockAlign, m.CbSize)
+			procCoTaskMemFree.Call(uintptr(mix))
+		}
 		return fmt.Errorf("IAudioClient.Initialize: %w", err)
 	}
 

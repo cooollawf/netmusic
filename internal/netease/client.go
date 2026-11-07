@@ -9,6 +9,7 @@ package netease
 
 import (
 	"crypto/md5"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -23,8 +24,9 @@ import (
 )
 
 const (
-	baseURL   = "https://music.163.com"
-	userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+	baseURL    = "https://music.163.com"
+	userAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+	appVersion = "2.10.6"
 )
 
 // Track is the compact song model used by lists and the player.
@@ -93,6 +95,29 @@ func NewClient(hc *http.Client) *Client {
 	return &Client{HTTP: hc, cookies: map[string]string{}}
 }
 
+// LoginError carries the NetEase status code so the UI can give an actionable
+// hint instead of a raw number.
+type LoginError struct {
+	Code int
+	Msg  string
+}
+
+func (e *LoginError) Error() string {
+	if e.Msg != "" {
+		return e.Msg
+	}
+	return fmt.Sprintf("netease: 登录失败 (code %d)", e.Code)
+}
+
+// Well known NetEase login codes.
+const (
+	CodeNoSuchUser  = 501
+	CodeBadPassword = 502
+	CodeNeedCaptcha = 503
+	CodeRiskControl = 8821
+	CodeEncRequired = 401
+)
+
 // ---------------------------------------------------------------------------
 // cookies
 // ---------------------------------------------------------------------------
@@ -120,7 +145,7 @@ func (c *Client) cookieHeader() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if len(c.cookies) == 0 {
-		return "os=pc; appver=2.10.6; osver=10;"
+		return "os=pc; appver=" + appVersion + "; osver=10; channel=netease;"
 	}
 	var b strings.Builder
 	for k, v := range c.cookies {
@@ -176,11 +201,58 @@ func (c *Client) newRequest(method, u string, body io.Reader) (*http.Request, er
 	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Referer", "https://music.163.com/")
+	req.Header.Set("Origin", "https://music.163.com")
+	// NetEase's own clients send the client identity as headers too; some
+	// endpoints (login) inspect them and reject requests without.
+	req.Header.Set("os", "pc")
+	req.Header.Set("appver", appVersion)
 	req.Header.Set("Cookie", c.cookieHeader())
 	if body != nil {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
 	return req, nil
+}
+
+// Warmup establishes a browser-like session: it asks for the home page so the
+// server hands out NMTID / __csrf / _ntes_nuid cookies, and seeds its own
+// stable device id when the server does not. Without this, login requests look
+// like they come from a brand new client and trip risk control.
+//
+// The warmup body is discarded, never buffered: it is HTML we do not need.
+func (c *Client) Warmup() error {
+	c.mu.Lock()
+	if c.cookies["_ntes_nuid"] == "" {
+		c.cookies["_ntes_nuid"] = randomHex(32)
+	}
+	if c.cookies["deviceId"] == "" {
+		c.cookies["deviceId"] = randomHex(32)
+	}
+	c.mu.Unlock()
+
+	req, err := c.newRequest(http.MethodGet, baseURL+"/", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	c.absorbCookies(resp)
+	return nil
+}
+
+func randomHex(n int) string {
+	const hexdigits = "0123456789abcdef"
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return strings.Repeat("0", n)
+	}
+	for i := range b {
+		b[i] = hexdigits[int(b[i])%16]
+	}
+	return string(b)
 }
 
 // doPost sends a form body and decodes JSON into out from the stream.
@@ -279,6 +351,12 @@ func (c *Client) QRCheck(key string) (QRState, error) {
 // login: cellphone
 // ---------------------------------------------------------------------------
 
+// LoginCellphone logs in with a phone number and password.
+//
+// Notes learned the hard way (see README): sending an *empty* csrf_token makes
+// the server answer 502 "请切换登录方式或升级版本" and never reaches the
+// credential check, so the token is only included when the warmup actually
+// produced one.
 func (c *Client) LoginCellphone(phone, password, countryCode string) (*Profile, error) {
 	if countryCode == "" {
 		countryCode = "86"
@@ -292,7 +370,57 @@ func (c *Client) LoginCellphone(phone, password, countryCode string) (*Profile, 
 		"type":          "1",
 		"https":         "true",
 		"remember":      "true",
-		"csrf_token":    c.csrfToken(),
+	}
+	return c.login(data)
+}
+
+// SendCaptcha asks NetEase to text a 6 digit code to the phone. This is the
+// supported way past risk control (code 8821) for password logins.
+func (c *Client) SendCaptcha(phone, countryCode string) error {
+	if countryCode == "" {
+		countryCode = "86"
+	}
+	params, err := Weapi(map[string]any{"cellphone": phone, "ctcode": countryCode})
+	if err != nil {
+		return err
+	}
+	var out apiError
+	if err := c.doPost("/weapi/sms/captcha/sent", url.Values{"params": {params["params"]}, "encSecKey": {params["encSecKey"]}}, &out); err != nil {
+		return err
+	}
+	if out.Code != 200 {
+		return &LoginError{Code: out.Code, Msg: out.Msg}
+	}
+	return nil
+}
+
+// LoginCaptcha logs in with the SMS code instead of a password.
+func (c *Client) LoginCaptcha(phone, captcha, countryCode string) (*Profile, error) {
+	if countryCode == "" {
+		countryCode = "86"
+	}
+	data := map[string]any{
+		"phone":         phone,
+		"countrycode":   countryCode,
+		"captcha":       captcha,
+		"rememberLogin": "true",
+		"type":          "1",
+		"https":         "true",
+		"remember":      "true",
+	}
+	return c.login(data)
+}
+
+// login performs the shared weapi/login/cellphone call and parses the profile.
+func (c *Client) login(data map[string]any) (*Profile, error) {
+	if tok := c.csrfToken(); tok != "" {
+		data["csrf_token"] = tok
+	}
+	// The client identity cookies must be present for the server to accept a
+	// login from a third party client at all.
+	if err := c.Warmup(); err != nil {
+		// A failed warmup is not fatal; the login may still work.
+		_ = err
 	}
 	params, err := Weapi(data)
 	if err != nil {
@@ -314,10 +442,11 @@ func (c *Client) LoginCellphone(phone, password, countryCode string) (*Profile, 
 		return nil, err
 	}
 	if out.Profile == nil {
-		if out.Msg != "" {
-			return nil, errors.New(out.Msg)
+		msg := out.Msg
+		if msg == "" {
+			msg = fmt.Sprintf("登录失败 (code %d)", out.Code)
 		}
-		return nil, fmt.Errorf("netease: login failed (code %d)", out.Code)
+		return nil, &LoginError{Code: out.Code, Msg: msg}
 	}
 	p := &Profile{
 		UserID:   out.Profile.UserID,
@@ -794,6 +923,53 @@ func flatten(s string) string {
 		b.WriteByte(s[i])
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// DebugWeapi sends an arbitrary weapi request and returns the raw body and any
+// cookies set, so login problems can be diagnosed without a debugger. It is
+// only used by nmprobe.
+func (c *Client) DebugWeapi(path string, data map[string]any) (int, []byte, []string, error) {
+	params, err := Weapi(data)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	form := url.Values{"params": {params["params"]}, "encSecKey": {params["encSecKey"]}}
+	req, err := c.newRequest(http.MethodPost, baseURL+path, strings.NewReader(form.Encode()))
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var cks []string
+	for _, ck := range resp.Cookies() {
+		cks = append(cks, ck.Name+"="+ck.Value)
+	}
+	c.absorbCookies(resp)
+	return resp.StatusCode, body, cks, nil
+}
+
+// DebugPost sends a plain /api/ POST and returns the raw body.
+func (c *Client) DebugPost(path string, form url.Values) (int, []byte, []string, error) {
+	req, err := c.newRequest(http.MethodPost, baseURL+path, strings.NewReader(form.Encode()))
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var cks []string
+	for _, ck := range resp.Cookies() {
+		cks = append(cks, ck.Name+"="+ck.Value)
+	}
+	c.absorbCookies(resp)
+	return resp.StatusCode, body, cks, nil
 }
 
 // PicURL returns a sized variant of a NetEase image URL.

@@ -676,8 +676,27 @@ func SetWindowFont(hwnd, font uintptr) {
 }
 
 // SetWindowLongPtr changes a window's data or window procedure.
+//
+// SetWindowLongPtrW / GetWindowLongPtrW only exist on 64-bit Windows; on 32-bit
+// they are SDK macros over the non-Ptr variants and user32.dll exports no such
+// name. Resolve lazily so one code path serves both — on a 32-bit Windows 7
+// target the Ptr variant would otherwise fail at first use.
 func SetWindowLongPtr(hwnd uintptr, index int, value uintptr) uintptr {
+	if err := procSetWindowLongPtr.Find(); err == nil {
+		r, _, _ := procSetWindowLongPtr.Call(hwnd, uintptr(index), value)
+		return r
+	}
 	r, _, _ := procSetWindowLong.Call(hwnd, uintptr(index), value)
+	return r
+}
+
+// GetWindowLongPtr mirrors SetWindowLongPtr.
+func GetWindowLongPtr(hwnd uintptr, index int) uintptr {
+	if err := procGetWindowLongPtr.Find(); err == nil {
+		r, _, _ := procGetWindowLongPtr.Call(hwnd, uintptr(index))
+		return r
+	}
+	r, _, _ := procGetWindowLong.Call(hwnd, uintptr(index))
 	return r
 }
 

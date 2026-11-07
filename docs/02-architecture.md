@@ -127,3 +127,16 @@ HTTP(整曲) → []byte(压缩, 1~3MB) → go-mp3 解码(按需) → IAudioRende
 - `weapi` 加密方案：`AES-128-CBC(presetKey) → Base64 → AES-128-CBC(随机16位密钥) → Base64`，随机密钥用**无填充 RSA** 加密成 `encSecKey`。本项目用 `crypto/aes` + `math/big` 重新实现（约 90 行），并且**修掉了它的一个隐患**：原实现 RSA 输出会丢前导零字节，这里补齐到模长，保证 `encSecKey` 恒为 256 hex。
 - 端点选择：`/api/song/enhance/player/url`、`/api/song/lyric`、`/api/v1/resource/comments/R_SO_4_*`、`/api/v6/playlist/detail`、`/api/nuser/account/get`、`/api/login/qrcode/*`。本项目优先选用**无需加密的 `/api/` 接口**，因此加密只用于手机号登录一条路径，依赖面积最小。
 - 为什么不会破坏内存约束：参考实现依赖 `req/v3`、`cookiejar`、`tcell`、`bubbletea`、`beep` 等，其中终端 UI（tcell）和音频（beep/gopxl）才是内存与 CPU 的大头。本项目一个都没有引入；唯一保留的运行时依赖是纯 Go 的 go-mp3（约 6k 行、无 cgo、无全局状态）。
+## 2.8 Windows 7 / 32 位适配要点
+
+- **工具链**：Go 1.20.14（1.21+ 不再支持 Win7）。
+- **只用 Vista 起就存在的 API**：WASAPI（Vista+）、`AUTOCONVERTPCM`（Win7+）、`SetProcessDPIAware`（Vista+）、
+  `EM_SETCUEBANNER`（Vista+）、`RegGetValueW`（Vista+）、`GetTickCount64`（Vista+）。不依赖 Win8/10 的 `GetDpiForWindow`、
+  `SetThreadDpiAwarenessContext` 等。
+- **字体**：`Microsoft YaHei`（Vista+），不用 Win8 才有的 `Microsoft YaHei UI`。
+- **清单文件**：`app.manifest` 经 windres 编成 `.syso` 参与链接，提供 comctl32 v6（输入框占位提示依赖它）、
+  `dpiAware=true` 和 Win7/8/8.1/10 的 `supportedOS` GUID（避免被套用兼容性垫片）。
+- **32 位 COM 调用约定**：所有 Win32/COM 都是 stdcall；`REFERENCE_TIME` 这类 64 位参数要按架构拆成 1 或 2 个栈槽
+  （`args_386.go` / `args_amd64.go` 的 `comArg64`），`MSG` 结构按架构分别定义（`msg_386.go` / `msg_amd64.go`），
+  `SetWindowLongPtr` 运行时探测 `Ptr` 版本是否存在。
+- **GUI 子系统**：链接时 `-H windowsgui`，避免双击弹出控制台窗口；代价是命令行采集 stderr 需要显式重定向。

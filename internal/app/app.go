@@ -640,6 +640,9 @@ func (a *App) toggleComments() {
 // ---------------------------------------------------------------------------
 
 func (a *App) bootstrap() {
+	// Warm the session up first: this is what makes the server treat us as a
+	// returning client instead of a brand new one (and hands out __csrf).
+	_ = a.cl.Warmup()
 	prof, err := a.cl.Account()
 	a.post(func() {
 		if err != nil || prof == nil {
@@ -826,6 +829,8 @@ func (a *App) wire() {
 
 	a.login.OnRequestQR = func() { a.requestQR() }
 	a.login.OnPhoneLogin = func(phone, pw string) { a.phoneLogin(phone, pw) }
+	a.login.OnSendCaptcha = func(phone string) { a.sendCaptcha(phone) }
+	a.login.OnCaptchaLogin = func(phone, code string) { a.captchaLogin(phone, code) }
 }
 
 func (a *App) refreshQueueVMs() {
@@ -972,7 +977,16 @@ func (a *App) phoneLogin(phone, pw string) {
 	go func() {
 		prof, err := a.cl.LoginCellphone(phone, pw, "86")
 		if err != nil {
-			a.post(func() { a.login.SetStatus(friendly(err), false) })
+			a.post(func() {
+				// Risk control on the password path: the supported workaround is
+				// the SMS code flow, so switch the form for the user.
+				var le *netease.LoginError
+				if errors.As(err, &le) && (le.Code == netease.CodeRiskControl || le.Code == netease.CodeNeedCaptcha) {
+					a.login.UseCaptchaMode(loginHint(err))
+					return
+				}
+				a.login.SetStatus(loginHint(err), false)
+			})
 			return
 		}
 		a.post(func() {
@@ -981,6 +995,72 @@ func (a *App) phoneLogin(phone, pw string) {
 		})
 		a.afterLogin()
 	}()
+}
+
+// sendCaptcha requests an SMS login code.
+func (a *App) sendCaptcha(phone string) {
+	if strings.TrimSpace(phone) == "" {
+		a.login.SetStatus("请先填写手机号", false)
+		return
+	}
+	a.login.SetStatus("正在发送验证码…", true)
+	go func() {
+		err := a.cl.SendCaptcha(phone, "86")
+		a.post(func() {
+			if err != nil {
+				a.login.SetStatus(loginHint(err), false)
+				return
+			}
+			a.login.SetStatus("验证码已发送，请查看短信", false)
+		})
+	}()
+}
+
+// captchaLogin logs in with the SMS code.
+func (a *App) captchaLogin(phone, code string) {
+	phone = strings.TrimSpace(phone)
+	code = strings.TrimSpace(code)
+	if phone == "" || code == "" {
+		a.login.SetStatus("请填写手机号和验证码", false)
+		return
+	}
+	a.login.SetStatus("登录中…", true)
+	go func() {
+		prof, err := a.cl.LoginCaptcha(phone, code, "86")
+		if err != nil {
+			a.post(func() { a.login.SetStatus(loginHint(err), false) })
+			return
+		}
+		a.post(func() {
+			a.profile = prof
+			a.login.SetStatus("登录成功", false)
+		})
+		a.afterLogin()
+	}()
+}
+
+// loginHint turns a NetEase status code into something actionable, in the
+// language of the person staring at the login window.
+func loginHint(err error) string {
+	var le *netease.LoginError
+	if errors.As(err, &le) {
+		switch le.Code {
+		case netease.CodeNoSuchUser:
+			return "账号不存在，请检查手机号"
+		case netease.CodeBadPassword:
+			return "密码错误或登录方式被限制，可改用验证码登录"
+		case netease.CodeNeedCaptcha:
+			return "需要短信验证码，请点“获取验证码”"
+		case netease.CodeRiskControl:
+			return "触发风控验证，请改用短信验证码或扫码登录"
+		case netease.CodeEncRequired:
+			return "请求被服务端拒绝，请稍后重试"
+		}
+		if le.Msg != "" {
+			return le.Msg
+		}
+	}
+	return friendly(err)
 }
 
 func (a *App) afterLogin() {

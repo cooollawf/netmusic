@@ -77,11 +77,15 @@ func InitTheme() {
 	if T.Scale < 1 {
 		T.Scale = 1
 	}
-	T.FontXS = w32.CreateFont(sz(11), 400, "Microsoft YaHei UI", false)
-	T.FontS = w32.CreateFont(sz(12), 400, "Microsoft YaHei UI", false)
-	T.FontM = w32.CreateFont(sz(13), 400, "Microsoft YaHei UI", false)
-	T.FontL = w32.CreateFont(sz(15), 700, "Microsoft YaHei UI", false)
-	T.FontXL = w32.CreateFont(sz(19), 700, "Microsoft YaHei UI", false)
+	// UIface: "Microsoft YaHei UI" only exists on Windows 8+, and the Windows 7
+// target is the reason this player exists. Plain "Microsoft YaHei" ships with
+// Vista and every later release, so one face name works everywhere.
+UIface := "Microsoft YaHei"
+	T.FontXS = w32.CreateFont(sz(11), 400, UIface, false)
+	T.FontS = w32.CreateFont(sz(12), 400, UIface, false)
+	T.FontM = w32.CreateFont(sz(13), 400, UIface, false)
+	T.FontL = w32.CreateFont(sz(15), 700, UIface, false)
+	T.FontXL = w32.CreateFont(sz(19), 700, UIface, false)
 }
 
 func sz(v int32) int32 { return dp(v) }

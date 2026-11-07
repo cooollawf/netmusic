@@ -65,8 +65,10 @@ var (
 	procSetFocus        = user32.NewProc("SetFocus")
 	procGetForeground   = user32.NewProc("GetForegroundWindow")
 	procSetProcessDPIAw = user32.NewProc("SetProcessDPIAware")
-	procSetWindowLong   = user32.NewProc("SetWindowLongPtrW")
-	procGetWindowLong   = user32.NewProc("GetWindowLongPtrW")
+	procSetWindowLongPtr = user32.NewProc("SetWindowLongPtrW")
+	procGetWindowLongPtr = user32.NewProc("GetWindowLongPtrW")
+	procSetWindowLong    = user32.NewProc("SetWindowLongW")
+	procGetWindowLong    = user32.NewProc("GetWindowLongW")
 	procGetAsyncKey     = user32.NewProc("GetAsyncKeyState")
 	procScrollWindowEx  = user32.NewProc("ScrollWindowEx")
 	procSetScrollInfo   = user32.NewProc("SetScrollInfo")
@@ -133,16 +135,6 @@ type RECT struct{ Left, Top, Right, Bottom int32 }
 func (r RECT) Dx() int32 { return r.Right - r.Left }
 func (r RECT) Dy() int32 { return r.Bottom - r.Top }
 
-type MSG struct {
-	Hwnd    uintptr
-	Message uint32
-	_       uint32
-	WParam  uintptr
-	LParam  uintptr
-	Time    uint32
-	Pt      POINT
-	_       uint32
-}
 
 type PAINTSTRUCT struct {
 	Hdc         uintptr
