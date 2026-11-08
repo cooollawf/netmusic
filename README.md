@@ -379,14 +379,17 @@ eq bypassed : 0s      => 无开销
 
 ## 十三、许可
 
-本项目采用 **CC BY-SA 4.0**（知识共享 署名-相同方式共享 4.0 国际）发布：
+**MIT License** — 见 [`LICENSE`](LICENSE)。
 
-- 许可证全文要点与链接：[LICENSE](LICENSE)
-- 第三方依赖（go-mp3 / go-qrcode）保留各自许可证，未被本次授权覆盖：[THIRD-PARTY.md](THIRD-PARTY.md)
+可以自由使用、修改、分发、商用、闭源衍生，只需在副本中保留版权声明与许可声明。
 
-简单说：可以自由使用、修改、再发布，**包括商业用途**，但必须署名、并以相同许可证共享你的修改。
+第三方依赖保留各自许可证，未被本次授权覆盖：
 
-> 说明：CC 官方并不建议把 CC 许可证用于软件（不涉及专利授权，ShareAlike 对编译产物也不太好落地）。
-> 这里按作者的要求选用 CC BY-SA 4.0；如果要换成软件界更常见的许可，MIT / Apache-2.0 是常规选择。
+| 组件 | 许可证 |
+|---|---|
+| [`github.com/hajimehoshi/go-mp3`](https://github.com/hajimehoshi/go-mp3) | ISC |
+| [`github.com/skip2/go-qrcode`](https://github.com/skip2/go-qrcode) | MIT |
+
+完整文本见 [`THIRD-PARTY.md`](THIRD-PARTY.md)。
 
 音乐数据（歌曲元数据、歌词、评论、音频流）版权归网易云音乐及各版权方所有，本仓库不包含任何音乐数据。

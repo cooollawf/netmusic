@@ -1,6 +1,6 @@
 # Third party components
 
-`netmusic` itself is licensed under CC BY-SA 4.0 (see `LICENSE`). The two Go
+`netmusic` itself is licensed under the MIT license (see `LICENSE`). The two Go
 modules it links are independent works with their own licenses; they are **not**
 relicensed by this project.
 
