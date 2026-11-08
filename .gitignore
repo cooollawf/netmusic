@@ -8,3 +8,6 @@ nmprobe64.exe
 *.tmp
 .commitmsg
 .pid
+.release-notes.md
+SHA256SUMS.txt
+LICENSES.txt
