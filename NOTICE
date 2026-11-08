@@ -1,0 +1,20 @@
+netmusic — lightweight NetEase Cloud Music desktop player
+
+Copyright (c) 2026 the netmusic contributors
+
+The full text of the license (CC BY-SA 4.0) is in the LICENSE file.
+
+Attribution notice, as required by CC BY-SA 4.0 section 3(a):
+  Title:      netmusic
+  Source:     https://github.com/cooollawf/netmusic
+  Author:     the netmusic contributors
+  License:    CC BY-SA 4.0, https://creativecommons.org/licenses/by-sa/4.0/
+  Changes:    if you redistribute a modified version, indicate that you changed it.
+
+Third party components keep their own licenses and are not covered by the
+license above. See THIRD-PARTY.md.
+
+Note: Creative Commons itself recommends against using CC licenses for
+software (no patent grant, ShareAlike is awkward for binaries). This project
+follows the copyright holder's explicit choice of CC BY-SA 4.0. MIT or
+Apache-2.0 would be the software-appropriate alternatives.
